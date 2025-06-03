@@ -1,0 +1,11 @@
+__pycache__/
+training/augment.py
+training/training_loop.py
+training/loss.py
+dataset_tool.py
+Dockerfile
+*.pkl
+train.py
+generate.py
+*.yml
+example.py
