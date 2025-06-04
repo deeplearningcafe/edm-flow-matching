@@ -1,7 +1,7 @@
 # download model
 import dnnlib
 import pickle
-import datetime
+from datetime import datetime
 import torch
 import random
 import numpy as np
@@ -227,6 +227,7 @@ def train(
         edm_params=None, # Use defaults or allow customization
         num_gen_samples_epoch_end=10, # Generate 10 samples
         num_inference_steps_epoch_end=50,
+        dtype=dtype,
         # W&B specific args
         wandb_project=wandb_project_name,
         wandb_run_name=current_run_name,
@@ -269,7 +270,7 @@ if __name__ == '__main__':
         fid_gen_batch_size=50,
         fid_inception_batch_size=50,
         fid_ref_path=cifar10_fid_ref_path, # Path to CIFAR10 FID stats
-        fid_num_workers=0 # Simpler for small test
+        fid_num_workers=2 # Simpler for small test
     )
 
     # To run STL10 finetuning (your main goal for distribution shift)
@@ -287,3 +288,8 @@ if __name__ == '__main__':
     #     # wandb_entity="your_wandb_username_or_team" # Set your entity
     #     seed=42 # Example seed
     # )
+
+
+"""
+Update the generate samples such that it generates a unique image with several generations like the example.py
+"""

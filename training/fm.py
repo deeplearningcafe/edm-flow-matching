@@ -113,6 +113,208 @@ def plot_generation_steps(
         plt.close(fig)
         return None
 
+def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
+    """
+    Create a grid from a batch of images.
+    
+    Args:
+        images: Tensor of shape (B, C, H, W) with values in [-1, 1]
+        gridw: Width of the grid (number of images per row)
+        gridh: Height of the grid (number of rows)
+    
+    Returns:
+        PIL Image of the grid
+    """
+    import PIL.Image
+    
+    batch_size = images.shape[0]
+    if batch_size < gridw * gridh:
+        # Pad with zeros if we don't have enough images
+        padding = torch.zeros(
+            gridw * gridh - batch_size, 
+            *images.shape[1:], 
+            device=images.device, 
+            dtype=images.dtype
+        )
+        images = torch.cat([images, padding], dim=0)
+    elif batch_size > gridw * gridh:
+        # Take only what we need
+        images = images[:gridw * gridh]
+    
+    # Denormalize from [-1, 1] to [0, 255]
+    images = (images * 127.5 + 128).clip(0, 255).to(torch.uint8)
+    
+    # Reshape to grid format
+    C, H, W = images.shape[1], images.shape[2], images.shape[3]
+    images = images.view(gridh, gridw, C, H, W)
+    images = images.permute(0, 3, 1, 4, 2)  # (gridh, H, gridw, W, C)
+    images = images.reshape(gridh * H, gridw * W, C)
+    
+    # Convert to PIL Image
+    images = images.cpu().numpy()
+    if C == 1:  # Grayscale
+        images = images.squeeze(-1)
+        return PIL.Image.fromarray(images, 'L')
+    else:  # RGB
+        return PIL.Image.fromarray(images, 'RGB')
+
+def plot_generation_steps_with_grid(
+    trajectory: List[torch.Tensor],
+    batch_labels: torch.Tensor = None,
+    num_classes: int = 10,
+    filename: str = "generation_results.png",
+    title: str = "Generation Results",
+    epoch: int = 0,
+    eval_interval: int = 100,
+    gridw: int = 8,
+    gridh: int = 8
+):
+    """
+    Enhanced plotting function that creates both trajectory and grid plots.
+    
+    Args:
+        trajectory: List of tensors (B, C, H, W) at different steps in [-1, 1] range
+        batch_labels: Labels for the batch, used to select one sample per class
+        num_classes: Number of classes (for trajectory selection)
+        filename: Output filename
+        title: Plot title
+        epoch: Current epoch number
+        eval_interval: Evaluation interval for custom x-axis
+        gridw: Grid width for final image grid
+        gridh: Grid height for final image grid
+    """
+    if not trajectory or len(trajectory) == 0:
+        print("Trajectory list is empty.")
+        return None
+    
+    # Create figure with subplots: trajectory on top, grid on bottom
+    fig = plt.figure(figsize=(16, 12))
+    
+    # === TRAJECTORY PLOT ===
+    # Select one sample per class for trajectory visualization
+    trajectory_indices = []
+    if batch_labels is not None:
+        # Find first occurrence of each class
+        for class_id in range(min(num_classes, batch_labels.max().item() + 1)):
+            class_mask = (batch_labels == class_id)
+            if class_mask.any():
+                first_idx = torch.where(class_mask)[0][0].item()
+                trajectory_indices.append(first_idx)
+    else:
+        # If no labels, just take first num_classes samples
+        trajectory_indices = list(range(min(num_classes, trajectory[0].shape[0])))
+    
+    num_traj_samples = len(trajectory_indices)
+    num_steps = len(trajectory)
+    
+    if num_traj_samples > 0 and num_steps > 0:
+        # Create subplot for trajectory (top half)
+        gs = fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.3)
+        
+        # Trajectory subplot
+        ax_traj = fig.add_subplot(gs[0])
+        
+        # Create trajectory grid
+        traj_fig, traj_axes = plt.subplots(
+            num_traj_samples, num_steps,
+            figsize=(num_steps * 1.2, num_traj_samples * 1.2)
+        )
+        
+        # Handle single sample/step cases
+        if num_traj_samples == 1 and num_steps == 1:
+            traj_axes = np.array([[traj_axes]])
+        elif num_traj_samples == 1:
+            traj_axes = traj_axes.reshape(1, num_steps)
+        elif num_steps == 1:
+            traj_axes = traj_axes.reshape(num_traj_samples, 1)
+        
+        for i, sample_idx in enumerate(trajectory_indices):
+            for j in range(num_steps):
+                img_tensor = trajectory[j][sample_idx]
+                
+                # Convert and denormalize
+                img = img_tensor.cpu().numpy()
+                if img.shape[0] == 1:  # Grayscale
+                    img = np.squeeze(img, axis=0)
+                    img = (img + 1.0) / 2.0
+                    img = np.clip(img, 0, 1)
+                    cmap = 'gray'
+                else:  # RGB
+                    img = np.transpose(img, (1, 2, 0))
+                    img = (img + 1.0) / 2.0
+                    img = np.clip(img, 0, 1)
+                    cmap = None
+                
+                ax = traj_axes[i, j]
+                ax.imshow(img, cmap=cmap)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                
+                # Add titles and labels
+                if i == 0:  # Step labels on top row
+                    # Custom x-axis based on eval_interval and epochs
+                    if j == 0:
+                        step_label = "t=0 (Noise)"
+                    elif j == num_steps - 1:
+                        step_label = "t=1 (Final)"
+                    else:
+                        # Calculate approximate step based on position
+                        progress = j / (num_steps - 1)
+                        step_num = int(progress * 50)  # Assuming 50 inference steps
+                        step_label = f"Step ~{step_num}"
+                    ax.set_title(step_label, fontsize=9)
+                
+                if j == 0:  # Class labels on left column
+                    class_label = (batch_labels[sample_idx].item() 
+                                 if batch_labels is not None 
+                                 else f"Sample {sample_idx}")
+                    ax.set_ylabel(f"Class {class_label}", fontsize=9)
+        
+        traj_fig.suptitle(f"Generation Trajectory - Epoch {epoch}", fontsize=14)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save trajectory plot separately
+        traj_filename = filename.replace('.png', '_trajectory.png')
+        traj_fig.savefig(traj_filename, dpi=100, bbox_inches='tight')
+        plt.close(traj_fig)
+        print(f"Saved trajectory plot to {traj_filename}")
+    
+    # === FINAL IMAGE GRID ===
+    if len(trajectory) > 0:
+        final_images = trajectory[-1]  # Get final generated images
+        
+        # Create and save image grid
+        grid_image = create_image_grid(final_images, gridw=gridw, gridh=gridh)
+        grid_filename = filename.replace('.png', '_grid.png')
+        grid_image.save(grid_filename)
+        print(f"Saved image grid to {grid_filename}")
+        
+        # Also create a matplotlib subplot for the grid in the main figure
+        ax_grid = fig.add_subplot(gs[1])
+        ax_grid.imshow(np.array(grid_image), cmap='gray' if final_images.shape[1] == 1 else None)
+        ax_grid.set_title(f"Generated Batch Grid - Epoch {epoch}", fontsize=12)
+        ax_grid.set_xticks([])
+        ax_grid.set_yticks([])
+        
+        # Add custom x-axis information
+        info_text = f"Epoch: {epoch} | Eval Interval: {eval_interval} | Batch Size: {final_images.shape[0]}"
+        ax_grid.text(0.5, -0.1, info_text, transform=ax_grid.transAxes, 
+                    ha='center', va='top', fontsize=10)
+    
+    # Save combined figure
+    fig.suptitle(title, fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    
+    try:
+        fig.savefig(filename, dpi=100, bbox_inches='tight')
+        print(f"Saved combined plot to {filename}")
+        plt.close(fig)
+        return filename
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+        plt.close(fig)
+        return None
+
 def sample_lognorm_timesteps(
     batch_size: int,
     mean: float = 0.0,
@@ -657,6 +859,35 @@ def train_flow_matching_edm_with_songunet(
         entity=wandb_entity
     )
 
+    if logging_utils.is_wandb_initialized():
+        # Define "epoch" as a custom x-axis.
+        # Metrics associated with it will be plotted against 'epoch'.
+        wandb.define_metric("epoch") 
+        
+        # Metrics that will use 'epoch' as their x-axis
+        wandb.define_metric("train/avg_epoch_loss", step_metric="epoch")
+        wandb.define_metric("eval/fid_score", step_metric="epoch")
+        # Images logged per epoch will also use 'epoch' as their step.
+        # The step value passed to wandb.log or log_image for these
+        # should be the epoch number.
+        wandb.define_metric(
+            "epoch_samples/*", step_metric="epoch", step_sync=True
+        )
+
+        # Define "eval_step" as a custom x-axis for metrics logged
+        # at each evaluation interval.
+        wandb.define_metric("eval_step") # Defines 'eval_step' as an x-axis
+
+        # Metrics that will use 'eval_step' as their x-axis
+        wandb.define_metric("eval/avg_val_loss", step_metric="eval_step")
+        wandb.define_metric(
+            "train/avg_loss_interval", step_metric="eval_step"
+        )
+        wandb.define_metric(
+            "eval/epoch_progress_at_eval", step_metric="eval_step"
+        )
+
+
     # Infer label_dim from the SongUNet model
     # SongUNet stores label_dim directly or via self.map_label
     model_label_dim = 0
@@ -665,8 +896,8 @@ def train_flow_matching_edm_with_songunet(
     elif hasattr(model, 'label_dim'): # If stored directly
         model_label_dim = model.label_dim
     print(f"Using model_label_dim: {model_label_dim}")
-    if logging_utils.is_wandb_initialized():
-        logging_utils.log_metrics({"model/label_dim": model_label_dim}, commit=False)
+    # if logging_utils.is_wandb_initialized():
+    #     logging_utils.log_metrics({"model/label_dim": model_label_dim}, commit=False)
 
     torch.cuda.empty_cache()
     img_resolution = img_shape[1] # Assuming H=W
@@ -743,7 +974,8 @@ def train_flow_matching_edm_with_songunet(
     best_eval_loss = float('inf')
     current_patience = 0
     global_step = 0
-
+    eval_log_step_count = 0 
+    
     try:
         print(f"Starting Flow Matching training for SongUNet (EDM pre-trained)...")
         for epoch in range(epochs):
@@ -755,10 +987,8 @@ def train_flow_matching_edm_with_songunet(
             for batch_idx, batch in enumerate(progress_bar):
                 optimizer.zero_grad()
 
-                x1_batch = batch[0].to(dtype, device)
-                cond_input_batch = batch[1].to(dtype, device) if len(batch) > 1 else None
-
-                optimizer.zero_grad()
+                x1_batch = batch[0].to(dtype=dtype).to(device)
+                cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
 
                 loss = flow_matching_step(
                     unet_model=model,
@@ -812,20 +1042,21 @@ def train_flow_matching_edm_with_songunet(
                     for i, pg in enumerate(optimizer.param_groups):
                         log_payload[f"lr_group_{pg.get('name', i)}"] = pg['lr']
 
-                    logging_utils.log_metrics(log_payload, step=global_step)
+                    logging_utils.log_metrics(log_payload, step=global_step, commit=True)
 
                 # Evaluation and logging
                 if (batch_idx + 1) % eval_interval == 0 or \
                    (batch_idx + 1) == len(train_loader):
+                    # Increment custom step counter for evaluation logs
+                    eval_log_step_count += 1
                     avg_train_loss_interval = epoch_loss_accum / num_batches_epoch
                     
-                    # Validation
                     model.eval()
                     val_loss = 0.0
                     with torch.no_grad():
                         for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-                            x1_batch = batch[0].to(dtype, device)
-                            cond_input_batch = batch[1].to(dtype, device) if len(batch) > 1 else None
+                            x1_batch = batch[0].to(dtype=dtype).to(device)
+                            cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
                             loss = flow_matching_step(
                                 unet_model=model,
                                 x1=x1_batch,
@@ -840,20 +1071,24 @@ def train_flow_matching_edm_with_songunet(
 
                     val_loss = val_loss / len(test_loader)
 
-                    print(f"\nEpoch {epoch+1}, Step {global_step}: "
-                          f"Train Loss: {avg_train_loss_interval:.4f}, "
+                    print(f"\nEpoch {epoch+1}, Batch {batch_idx+1}/"
+                          f"{len(train_loader)}, EvalStep {eval_log_step_count}: "
+                          f"Train Loss Interval: {avg_train_loss_interval:.4f}, "
                           f"Val Loss: {val_loss:.4f}")
 
                     if logging_utils.is_wandb_initialized():
+                        current_epoch_progress = epoch + \
+                            (batch_idx + 1) / len(train_loader)
+                        # Log eval metrics against custom 'eval_step'
                         logging_utils.log_metrics({
                             "eval/avg_val_loss": val_loss,
-                            "train/avg_loss_interval": avg_train_loss_interval,
-                            "epoch": epoch + (batch_idx + 1) / len(train_loader)
-                        }, step=global_step)
+                            "train/avg_loss_interval": avg_train_loss_interval, # noqa
+                            "eval/epoch_progress_at_eval": current_epoch_progress # noqa
+                        }, step=eval_log_step_count, commit=True) # Use eval_log_step_count
 
                     # Checkpointing and Early Stopping
-                    if val_loss < best_eval:
-                        best_eval = val_loss
+                    if val_loss < best_eval_loss:
+                        best_eval_loss = val_loss
                         current_patience = 0
                         save_path = os.path.join(
                             logging_utils._wandb_run.dir if logging_utils.is_wandb_initialized() and hasattr(logging_utils._wandb_run, 'dir') else ".",
@@ -861,14 +1096,14 @@ def train_flow_matching_edm_with_songunet(
                         )
                         torch.save(model.state_dict(), save_path)
                         print(f"  -> New best val loss: {best_eval_loss:.4f}. Model saved to {save_path}")
-                        if logging_utils.is_wandb_initialized():
-                            wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
+                        # if logging_utils.is_wandb_initialized():
+                        #     wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
                     else:
                         current_patience += 1
                         if current_patience >= patience:
                             print(f"Early stopping triggered after {patience} evaluations without improvement.")
                             if logging_utils.is_wandb_initialized():
-                                logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step)
+                                logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step+1)
                             raise StopIteration # Use custom exception or break
                     model.train()
             
@@ -878,8 +1113,7 @@ def train_flow_matching_edm_with_songunet(
             if logging_utils.is_wandb_initialized():
                 logging_utils.log_metrics({
                     "train/avg_epoch_loss": avg_epoch_loss,
-                    "epoch": epoch + 1
-                }, step=global_step)
+                }, step=epoch + 1, commit=False)
 
             # Generate and log samples at the end of each epoch
             if num_gen_samples_epoch_end > 0:
@@ -890,9 +1124,15 @@ def train_flow_matching_edm_with_songunet(
                 if model_label_dim > 0:
                     # Ensure labels are within the valid range [0, model_label_dim - 1]
                     num_labels_to_gen = min(model_label_dim, num_gen_samples_epoch_end)
-                    gen_labels = torch.arange(num_labels_to_gen, device=device) \
-                                     if num_labels_to_gen > 0 else None
-                
+                    if num_gen_samples_epoch_end <= model_label_dim:
+                        # If batch size <= number of classes, use sequential labels
+                        gen_labels = torch.arange(num_gen_samples_epoch_end, device=device)
+                    else:
+                        # If batch size > number of classes, repeat the sequence
+                        base_labels = torch.arange(model_label_dim, device=device)
+                        repeats = (num_gen_samples_epoch_end + model_label_dim - 1) // model_label_dim
+                        gen_labels = base_labels.repeat(repeats)[:num_gen_samples_epoch_end]
+                    
                 # If gen_labels is still None (e.g. unconditional or model_label_dim is 0)
                 # and we still want to generate samples, num_gen_samples_epoch_end will be used.
                 actual_num_samples_to_gen = num_gen_samples_epoch_end
@@ -927,30 +1167,64 @@ def train_flow_matching_edm_with_songunet(
 
                     full_plot_path = os.path.join(save_dir, trajectory_plot_filename)
 
-                    saved_plot_path = plot_generation_steps(
-                        traj, num_images_to_show=min(8, actual_num_samples_to_gen), # Show up to 8 images in the plot
+                    # saved_plot_path = plot_generation_steps(
+                    #     traj, num_images_to_show=min(8, actual_num_samples_to_gen), # Show up to 8 images in the plot
+                    #     filename=full_plot_path,
+                    #     title=f"FM Samples Epoch {epoch+1}"
+                    # )
+                    saved_plot_path = plot_generation_steps_with_grid(
+                        traj, 
+                        batch_labels=gen_labels,
+                        num_classes=model_label_dim if model_label_dim > 0 else 10,
                         filename=full_plot_path,
-                        title=f"FM Samples Epoch {epoch+1}"
-                    )
+                        title=f"FM Generation Results - Epoch {epoch+1}",
+                        epoch=epoch+1,
+                        eval_interval=eval_log_step_count,  # Use your actual eval_interval here
+                        gridw=8, 
+                        gridh=8)
 
                     if saved_plot_path and logging_utils.is_wandb_initialized():
-                        logging_utils.log_image(
-                            "epoch_samples/generation_trajectory",
-                            saved_plot_path,
-                            caption=f"Trajectory at Epoch {epoch+1}",
-                            step=global_step
-                        )
+                        # logging_utils.log_image(
+                        #     "epoch_samples/generation_trajectory",
+                        #     saved_plot_path,
+                        #     caption=f"Trajectory at Epoch {epoch+1}",
+                        #     step=epoch+1,
+                        #     commit=False
+                        # )
                         # Log individual final images as well for easier viewing
-                        final_images_to_log = min(images.size(0), 16) # Log up to 16 final images
-                        for i in range(final_images_to_log):
-                            img_to_log = (images[i].permute(1,2,0).numpy() + 1) / 2 # Denorm HWC
-                            img_to_log = np.clip(img_to_log, 0, 1)
+                        # final_images_to_log = min(images.size(0), 16) # Log up to 16 final images
+                        # for i in range(final_images_to_log):
+                        #     img_to_log = (images[i].permute(1,2,0).numpy() + 1) / 2 # Denorm HWC
+                        #     img_to_log = np.clip(img_to_log, 0, 1)
+                        #     logging_utils.log_image(
+                        #         f"epoch_samples/final_sample_{i}",
+                        #         img_to_log,
+                        #         caption=f"Final Sample {i} Epoch {epoch+1} Label: {gen_labels[i].item() if gen_labels is not None and i < len(gen_labels) else 'N/A'}",
+                        #         step=epoch+1,
+                        #         commit=False
+                        #     )
+                        # Log trajectory and grid separately if they exist
+                        traj_path = saved_plot_path.replace('.png', '_trajectory.png')
+                        grid_path = saved_plot_path.replace('.png', '_grid.png')
+                        
+                        if os.path.exists(traj_path):
                             logging_utils.log_image(
-                                f"epoch_samples/final_sample_{i}",
-                                img_to_log,
-                                caption=f"Final Sample {i} Epoch {epoch+1} Label: {gen_labels[i].item() if gen_labels is not None and i < len(gen_labels) else 'N/A'}",
-                                step=global_step
+                                "epoch_samples/generation_trajectory",
+                                traj_path,
+                                caption=f"Trajectory at Epoch {epoch+1}",
+                                step=epoch+1,
+                                commit=False
                             )
+                        
+                        if os.path.exists(grid_path):
+                            logging_utils.log_image(
+                                "epoch_samples/grid",
+                                grid_path,
+                                caption=f"Generated Grid at Epoch {epoch+1}",
+                                step=epoch+1,
+                                commit=False
+                            )
+
             
                 perform_fid = (
                     fid_ref_path and 
@@ -1026,7 +1300,8 @@ def train_flow_matching_edm_with_songunet(
                             if logging_utils.is_wandb_initialized():
                                 logging_utils.log_metrics(
                                     {"eval/fid_score": fid_score},
-                                    step=global_step
+                                    step=epoch+1,
+                                    commit=True
                                 )
                         else:
                             print("  Not enough samples generated for FID.")
@@ -1037,7 +1312,7 @@ def train_flow_matching_edm_with_songunet(
                             "components are available.")
                         if logging_utils.is_wandb_initialized():
                             logging_utils.log_metrics(
-                                {"eval/fid_error_import": 1}, step=global_step
+                                {"eval/fid_error_import": 1}, step=epoch+1
                             )
                     except Exception as e:
                         print(f"Error during FID calculation: {e}")
@@ -1045,7 +1320,7 @@ def train_flow_matching_edm_with_songunet(
                         traceback.print_exc()
                         if logging_utils.is_wandb_initialized():
                             logging_utils.log_metrics(
-                                {"eval/fid_error_runtime": 1}, step=global_step
+                                {"eval/fid_error_runtime": 1}, step=epoch+1
                             )
                     finally:
                         print(f"  Cleaning up FID temp directory: {fid_temp_dir}")
@@ -1070,8 +1345,8 @@ def train_flow_matching_edm_with_songunet(
                 f"edm_fm_epoch_{epoch+1}.pt"
             )
             torch.save(model.state_dict(), epoch_save_path)
-            if logging_utils.is_wandb_initialized():
-                 wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
+            # if logging_utils.is_wandb_initialized():
+            #      wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
 
         print("Training finished normally.")
 
