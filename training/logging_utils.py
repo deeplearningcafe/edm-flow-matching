@@ -32,9 +32,9 @@ def init_wandb(project_name: str, run_name: str = None, config: dict = None, ent
         print(f"Error initializing W&B: {e}. W&B logging will be disabled.")
         _wandb_run = None # Ensure it's None if init fails
 
-def log_metrics(metrics_dict: dict, step: int = None, commit: bool = True):
+def log_metrics(metrics_dict: dict, step: int = None, commit: bool = False):
     """
-    Logs a dictionary of metrics to W&B.
+    Logs a dictionary of metrics to W&B with improved error handling.
 
     Args:
         metrics_dict (dict): Dictionary of metric_name: value.
@@ -45,31 +45,44 @@ def log_metrics(metrics_dict: dict, step: int = None, commit: bool = True):
     """
     if _wandb_run:
         try:
-            _wandb_run.log(metrics_dict, step=step, commit=commit)
+            # Ensure step is provided for custom metrics to avoid conflicts
+            if step is not None:
+                _wandb_run.log(metrics_dict, step=step, commit=commit)
+            else:
+                # Let wandb handle the step automatically for default metrics
+                _wandb_run.log(metrics_dict, commit=commit)
         except Exception as e:
             print(f"Error logging metrics to W&B: {e}")
+            print(f"Metrics: {metrics_dict}, Step: {step}")
 
 def log_image(
     image_key: str,
-    image_data, # Can be PIL Image, numpy array, torch tensor, or path to image
+    image_data,  # Can be PIL Image, numpy array, torch tensor, or path to image
     caption: str = None,
-    step: int = None
+    step: int = None,
+    commit: bool = False
 ):
     """
-    Logs an image to W&B.
+    Logs an image to W&B with explicit step and commit control.
 
     Args:
         image_key (str): Key for the image in W&B dashboard.
         image_data: The image data.
         caption (str, optional): Caption for the image.
         step (int, optional): The current step.
+        commit (bool): Whether to commit the log immediately.
     """
     if _wandb_run:
         try:
             wandb_image = wandb.Image(image_data, caption=caption)
-            _wandb_run.log({image_key: wandb_image}, step=step)
+            if step is not None:
+                _wandb_run.log({image_key: wandb_image}, step=step, 
+                              commit=commit)
+            else:
+                _wandb_run.log({image_key: wandb_image}, commit=commit)
         except Exception as e:
             print(f"Error logging image to W&B: {e}")
+            print(f"Image key: {image_key}, Step: {step}")
 
 def finish_wandb():
     """Finishes the current W&B run."""

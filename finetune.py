@@ -61,7 +61,8 @@ def load_trainable_model(network_pkl, device, dtype=torch.float32):
 
 def load_inception_model(
     device: torch.device,
-    detector_url: str = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl' # noqa
+    detector_url: str = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl',
+    ref_url: str = 'https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz'
 ):
     """Loads the Inception-v3 model for FID calculation."""
     if dnnlib is None or pickle is None:
@@ -77,12 +78,21 @@ def load_inception_model(
         inception_model = inception_model.to(device)
         inception_model.eval() # Ensure it's in eval mode
         print('Inception-v3 model loaded successfully.')
-        return inception_model
     except Exception as e:
         print(f"Error loading Inception-v3 model: {e}. "
               "FID calculation will be disabled.")
         return None
 
+    try:
+        with dnnlib.util.open_url(ref_url) as f:
+            ref = dict(np.load(f))
+        print("Reference loaded successfully.")
+        return inception_model, ref
+
+    except Exception as e:
+        print(f"Error loading Ref : {e}. "
+              "FID calculation will be disabled.")
+        return inception_model, None
 
 
 def train(
@@ -95,6 +105,8 @@ def train(
         patience = 4,
         num_workers=2,
         wd = 0.02,
+        num_gen_samples_epoch_end=10, # Generate 10 samples
+        num_inference_steps_epoch_end=50,
         dtype=torch.bfloat16,
         # W&B arguments
         wandb_project_name="edm_fm_finetune_cifar10_shift",
@@ -144,7 +156,7 @@ def train(
     inception_model_instance = None
     if fid_eval_epochs > 0 and fid_ref_path:
         print("FID calculation is enabled. Attempting to load Inception model.")
-        inception_model_instance = load_inception_model(device)
+        inception_model_instance, cifar10_ref = load_inception_model(device)
         if inception_model_instance is None:
             print("Failed to load Inception model. FID will be disabled.")
             # Effectively disable FID by not passing the model or path
@@ -225,8 +237,8 @@ def train(
         seed=seed,
         img_shape=img_shape,
         edm_params=None, # Use defaults or allow customization
-        num_gen_samples_epoch_end=10, # Generate 10 samples
-        num_inference_steps_epoch_end=50,
+        num_gen_samples_epoch_end=num_gen_samples_epoch_end, # Generate 10 samples
+        num_inference_steps_epoch_end=num_inference_steps_epoch_end,
         dtype=dtype,
         # W&B specific args
         wandb_project=wandb_project_name,
@@ -235,6 +247,7 @@ def train(
         log_config=config_for_wandb,
         # Pass FID related parameters and the loaded Inception model
         inception_model=inception_model_instance,
+        fid_ref=cifar10_ref,
         fid_eval_epochs=fid_eval_epochs,
         fid_num_samples=fid_num_samples,
         fid_gen_batch_size=fid_gen_batch_size,
@@ -256,19 +269,22 @@ if __name__ == '__main__':
     train(
         network_pkl=cifar10_edm_pkl,
         dataset_name="cifar10",
-        batch_size=128, # Adjust based on VRAM
+        batch_size=32, # Adjust based on VRAM
         learning_rate=5e-5,
-        epochs=20, # For a quick test
-        eval_interval=50, # Evaluate more frequently for small datasets
+        epochs=5, # For a quick test
+        eval_interval=100000, # Evaluate more frequently for small datasets
         patience=5,
-        dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
+        num_gen_samples_epoch_end = 16,
+        num_inference_steps_epoch_end = 50,
+        # dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
+        dtype=torch.float32,
         wandb_project_name="my-edm-fm-tests", # Change to your project
         wandb_run_name_prefix="cifar10-fm-test",
-        # wandb_entity="your_wandb_username_or_team" # Set your entity
+        wandb_entity="YOUR-WANDB", # Set your entity
         fid_eval_epochs=1, # Evaluate FID every epoch for this test
-        fid_num_samples=100, # Small number for quick test
-        fid_gen_batch_size=50,
-        fid_inception_batch_size=50,
+        fid_num_samples=32, # Small number for quick test
+        fid_gen_batch_size=16,
+        fid_inception_batch_size=16,
         fid_ref_path=cifar10_fid_ref_path, # Path to CIFAR10 FID stats
         fid_num_workers=2 # Simpler for small test
     )

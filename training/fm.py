@@ -8,312 +8,22 @@ from datetime import datetime
 import numpy as np # For SongUNet's np.sqrt
 import re # For layer name matching in LR grouping
 from typing import List, Dict
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import numpy as np
-try:
-    # For ImageFolderDataset used in FID calculation
-    from training import dataset as edm_dataset
-except ImportError:
-    print("Warning: training.dataset (from EDM) not found. "
-          "FID calculation will be disabled if it relies on this.")
-    edm_dataset = None # Set to None if not found
 try:
     from . import logging_utils # if logging_utils is in the same package
 except ImportError:
     import logging_utils # if logging_utils is a top-level module
 import wandb
-import tempfile
-import shutil
-from PIL import Image
-import scipy.linalg
+try:
+    from training.plot_utils import plot_generation_steps_with_grid, generate_samples_edm_fm
+except ImportError:
+    from plot_utils import plot_generation_steps_with_grid, generate_samples_edm_fm
+try:
+    from training.fid import evaluate_fid
+except ImportError:
+    from fid import evaluate_fid
 
-def plot_generation_steps(
-    trajectory: List[torch.Tensor], # List of tensors (B, C, H, W) at different steps in [-1, 1] range
-    num_images_to_show: int = 8, # How many samples from the batch to display
-    filename: str = "generation_trajectory.png",
-    title: str = "Generation Trajectory"
-):
-    """Plots the generation process by showing images at different steps."""
-    if not trajectory:
-        print("Trajectory list is empty.")
-        return None
-
-    num_steps = len(trajectory)
-    if num_steps == 0:
-        print("Trajectory contains no steps.")
-        return
-    # Ensure we don't try to show more images than available in batch
-    num_images_to_show = min(num_images_to_show, trajectory[0].shape[0])
-    if num_images_to_show == 0:
-        print("No images to show (batch size might be 0 or num_images_to_show=0).")
-        return
-
-    # Create a grid: rows=num_images_to_show, cols=num_steps
-    fig, axes = plt.subplots(
-        num_images_to_show,
-        num_steps,
-        figsize=(num_steps * 1.5, num_images_to_show * 1.5)
-    )
-
-    # Handle single image/step case for axes indexing, ensure axes is always 2D array
-    if num_images_to_show == 1 and num_steps == 1:
-        axes = np.array([[axes]])
-    elif num_images_to_show == 1:
-        axes = axes.reshape(1, num_steps)
-    elif num_steps == 1:
-        axes = axes.reshape(num_images_to_show, 1)
-
-
-    for i in range(num_images_to_show): # Iterate through samples in batch
-        for j in range(num_steps): # Iterate through time steps
-            img_tensor = trajectory[j][i] # Get i-th image at j-th step
-            # --- CHANGE: Denormalization happens HERE, right before plotting ---
-            # Convert tensor to numpy: (C, H, W) -> (H, W, C) or (H, W)
-            # And denormalize from [-1, 1] to [0, 1]
-            img = img_tensor.numpy()
-            if img.shape[0] == 1: # Grayscale: (1, H, W) -> (H, W)
-                img = np.squeeze(img, axis=0)
-                # Denormalize: (img + 1) / 2
-                img = (img + 1.0) / 2.0
-                img = np.clip(img, 0, 1) # Clip to ensure valid range
-                cmap = 'gray'
-            else: # RGB: (C, H, W) -> (H, W, C)
-                img = np.transpose(img, (1, 2, 0))
-                # Denormalize: (img + 1) / 2
-                img = (img + 1.0) / 2.0
-                img = np.clip(img, 0, 1) # Clip to ensure valid range
-                cmap = None # Use default RGB colormap handling
-
-            ax = axes[i, j]
-            ax.imshow(img, cmap=cmap)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if i == 0: # Add step title only for the first row
-                # Determine step number (approximate based on saved steps)
-                total_inference_steps = 50 # Assuming this was the input to generate_samples_fm
-                save_interval = max(1, total_inference_steps // 10)
-                step_num_approx = (j-1) * save_interval if j > 0 else 0
-                if j == 0: step_label = "t=0 (Noise)"
-                elif j == num_steps - 1: step_label = f"t=1 (Final)" # Step {total_inference_steps}
-                else: step_label = f"Step ~{step_num_approx+1}"
-
-                ax.set_title(step_label, fontsize=8)
-
-
-    plt.suptitle(title, fontsize=14)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout for suptitle
-    try:
-        plt.savefig(filename)
-        print(f"Saved generation trajectory plot to {filename}")
-        plt.close(fig) # Close the figure to free memory
-        return filename # Return the path to the saved image
-    except Exception as e:
-        print(f"Error saving plot: {e}")
-        plt.close(fig)
-        return None
-
-def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
-    """
-    Create a grid from a batch of images.
-    
-    Args:
-        images: Tensor of shape (B, C, H, W) with values in [-1, 1]
-        gridw: Width of the grid (number of images per row)
-        gridh: Height of the grid (number of rows)
-    
-    Returns:
-        PIL Image of the grid
-    """
-    import PIL.Image
-    
-    batch_size = images.shape[0]
-    if batch_size < gridw * gridh:
-        # Pad with zeros if we don't have enough images
-        padding = torch.zeros(
-            gridw * gridh - batch_size, 
-            *images.shape[1:], 
-            device=images.device, 
-            dtype=images.dtype
-        )
-        images = torch.cat([images, padding], dim=0)
-    elif batch_size > gridw * gridh:
-        # Take only what we need
-        images = images[:gridw * gridh]
-    
-    # Denormalize from [-1, 1] to [0, 255]
-    images = (images * 127.5 + 128).clip(0, 255).to(torch.uint8)
-    
-    # Reshape to grid format
-    C, H, W = images.shape[1], images.shape[2], images.shape[3]
-    images = images.view(gridh, gridw, C, H, W)
-    images = images.permute(0, 3, 1, 4, 2)  # (gridh, H, gridw, W, C)
-    images = images.reshape(gridh * H, gridw * W, C)
-    
-    # Convert to PIL Image
-    images = images.cpu().numpy()
-    if C == 1:  # Grayscale
-        images = images.squeeze(-1)
-        return PIL.Image.fromarray(images, 'L')
-    else:  # RGB
-        return PIL.Image.fromarray(images, 'RGB')
-
-def plot_generation_steps_with_grid(
-    trajectory: List[torch.Tensor],
-    batch_labels: torch.Tensor = None,
-    num_classes: int = 10,
-    filename: str = "generation_results.png",
-    title: str = "Generation Results",
-    epoch: int = 0,
-    eval_interval: int = 100,
-    gridw: int = 8,
-    gridh: int = 8
-):
-    """
-    Enhanced plotting function that creates both trajectory and grid plots.
-    
-    Args:
-        trajectory: List of tensors (B, C, H, W) at different steps in [-1, 1] range
-        batch_labels: Labels for the batch, used to select one sample per class
-        num_classes: Number of classes (for trajectory selection)
-        filename: Output filename
-        title: Plot title
-        epoch: Current epoch number
-        eval_interval: Evaluation interval for custom x-axis
-        gridw: Grid width for final image grid
-        gridh: Grid height for final image grid
-    """
-    if not trajectory or len(trajectory) == 0:
-        print("Trajectory list is empty.")
-        return None
-    
-    # Create figure with subplots: trajectory on top, grid on bottom
-    fig = plt.figure(figsize=(16, 12))
-    
-    # === TRAJECTORY PLOT ===
-    # Select one sample per class for trajectory visualization
-    trajectory_indices = []
-    if batch_labels is not None:
-        # Find first occurrence of each class
-        for class_id in range(min(num_classes, batch_labels.max().item() + 1)):
-            class_mask = (batch_labels == class_id)
-            if class_mask.any():
-                first_idx = torch.where(class_mask)[0][0].item()
-                trajectory_indices.append(first_idx)
-    else:
-        # If no labels, just take first num_classes samples
-        trajectory_indices = list(range(min(num_classes, trajectory[0].shape[0])))
-    
-    num_traj_samples = len(trajectory_indices)
-    num_steps = len(trajectory)
-    
-    if num_traj_samples > 0 and num_steps > 0:
-        # Create subplot for trajectory (top half)
-        gs = fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.3)
-        
-        # Trajectory subplot
-        ax_traj = fig.add_subplot(gs[0])
-        
-        # Create trajectory grid
-        traj_fig, traj_axes = plt.subplots(
-            num_traj_samples, num_steps,
-            figsize=(num_steps * 1.2, num_traj_samples * 1.2)
-        )
-        
-        # Handle single sample/step cases
-        if num_traj_samples == 1 and num_steps == 1:
-            traj_axes = np.array([[traj_axes]])
-        elif num_traj_samples == 1:
-            traj_axes = traj_axes.reshape(1, num_steps)
-        elif num_steps == 1:
-            traj_axes = traj_axes.reshape(num_traj_samples, 1)
-        
-        for i, sample_idx in enumerate(trajectory_indices):
-            for j in range(num_steps):
-                img_tensor = trajectory[j][sample_idx]
-                
-                # Convert and denormalize
-                img = img_tensor.cpu().numpy()
-                if img.shape[0] == 1:  # Grayscale
-                    img = np.squeeze(img, axis=0)
-                    img = (img + 1.0) / 2.0
-                    img = np.clip(img, 0, 1)
-                    cmap = 'gray'
-                else:  # RGB
-                    img = np.transpose(img, (1, 2, 0))
-                    img = (img + 1.0) / 2.0
-                    img = np.clip(img, 0, 1)
-                    cmap = None
-                
-                ax = traj_axes[i, j]
-                ax.imshow(img, cmap=cmap)
-                ax.set_xticks([])
-                ax.set_yticks([])
-                
-                # Add titles and labels
-                if i == 0:  # Step labels on top row
-                    # Custom x-axis based on eval_interval and epochs
-                    if j == 0:
-                        step_label = "t=0 (Noise)"
-                    elif j == num_steps - 1:
-                        step_label = "t=1 (Final)"
-                    else:
-                        # Calculate approximate step based on position
-                        progress = j / (num_steps - 1)
-                        step_num = int(progress * 50)  # Assuming 50 inference steps
-                        step_label = f"Step ~{step_num}"
-                    ax.set_title(step_label, fontsize=9)
-                
-                if j == 0:  # Class labels on left column
-                    class_label = (batch_labels[sample_idx].item() 
-                                 if batch_labels is not None 
-                                 else f"Sample {sample_idx}")
-                    ax.set_ylabel(f"Class {class_label}", fontsize=9)
-        
-        traj_fig.suptitle(f"Generation Trajectory - Epoch {epoch}", fontsize=14)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
-        # Save trajectory plot separately
-        traj_filename = filename.replace('.png', '_trajectory.png')
-        traj_fig.savefig(traj_filename, dpi=100, bbox_inches='tight')
-        plt.close(traj_fig)
-        print(f"Saved trajectory plot to {traj_filename}")
-    
-    # === FINAL IMAGE GRID ===
-    if len(trajectory) > 0:
-        final_images = trajectory[-1]  # Get final generated images
-        
-        # Create and save image grid
-        grid_image = create_image_grid(final_images, gridw=gridw, gridh=gridh)
-        grid_filename = filename.replace('.png', '_grid.png')
-        grid_image.save(grid_filename)
-        print(f"Saved image grid to {grid_filename}")
-        
-        # Also create a matplotlib subplot for the grid in the main figure
-        ax_grid = fig.add_subplot(gs[1])
-        ax_grid.imshow(np.array(grid_image), cmap='gray' if final_images.shape[1] == 1 else None)
-        ax_grid.set_title(f"Generated Batch Grid - Epoch {epoch}", fontsize=12)
-        ax_grid.set_xticks([])
-        ax_grid.set_yticks([])
-        
-        # Add custom x-axis information
-        info_text = f"Epoch: {epoch} | Eval Interval: {eval_interval} | Batch Size: {final_images.shape[0]}"
-        ax_grid.text(0.5, -0.1, info_text, transform=ax_grid.transAxes, 
-                    ha='center', va='top', fontsize=10)
-    
-    # Save combined figure
-    fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    
-    try:
-        fig.savefig(filename, dpi=100, bbox_inches='tight')
-        print(f"Saved combined plot to {filename}")
-        plt.close(fig)
-        return filename
-    except Exception as e:
-        print(f"Error saving plot: {e}")
-        plt.close(fig)
-        return None
 
 def sample_lognorm_timesteps(
     batch_size: int,
@@ -426,113 +136,6 @@ def flow_matching_step(
     loss = F.mse_loss(v_pred, v_true, reduction="mean")
     return loss
 
-def generate_samples_edm_fm(
-    unet_model: torch.nn.Module, # Expects a SongUNet instance
-    num_samples: int = 10,
-    # cond_input for generation (e.g., list of int labels or pre-formatted)
-    cond_input: torch.Tensor = None,
-    device: str = "cuda",
-    num_inference_steps: int = 50,
-    img_shape: tuple = (3, 32, 32),
-    edm_params: dict = None,
-    seed: int = None,
-    # unet_label_dim is SongUNet's label_dim
-    unet_label_dim: int = 0,
-    dtype=torch.float32,
-):
-    """
-    Generates samples using Flow Matching with a SongUNet.
-    Uses a simple Euler ODE solver.
-    """
-    if edm_params is None:
-        edm_params = {
-            'sigma_min': 0.002, 'sigma_max': 80.0, 'sigma_data': 0.5
-        }
-
-    unet_model.eval()
-    rand_kwargs = {}
-    if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(seed)
-        rand_kwargs['generator'] = generator
-
-    # Initialize from noise (x0)
-    x = torch.randn(num_samples, *img_shape, device=device, dtype=dtype, **rand_kwargs)
-
-    # Time steps for Euler solver (from t=0 to t=1)
-    t_steps = torch.linspace(0, 1, num_inference_steps + 1, device=device)
-    trajectory = [x.detach().cpu()]
-
-    # Prepare `class_labels` for SongUNet for the entire batch
-    unet_class_labels_gen = None
-    if unet_label_dim > 0:
-        if cond_input is None:
-            # If conditional model but no labels, generate random labels
-            # or raise error. For now, let's generate random ones.
-            print(f"Warning: Conditional model (label_dim={unet_label_dim}) "
-                  "but no cond_input provided. Generating random labels.")
-            cond_input = torch.randint(
-                0, unet_label_dim, (num_samples,),
-                device=device, generator=generator
-            )
-        # Ensure cond_input is a tensor of integer labels for one-hot
-        if not isinstance(cond_input, torch.Tensor):
-            cond_input_tensor = torch.tensor(
-                cond_input, dtype=torch.long, device=device
-            )
-        else:
-            cond_input_tensor = cond_input.to(
-                device=device, dtype=torch.long
-            )
-
-        # One-hot encode the labels
-        unet_class_labels_gen = F.one_hot(
-            cond_input_tensor, num_classes=unet_label_dim
-        ).to(dtype)
-        # Ensure batch size of labels matches num_samples
-        if unet_class_labels_gen.shape[0] != num_samples:
-            if unet_class_labels_gen.shape[0] == 1 and num_samples > 1:
-                print(f"Repeating single cond_input for {num_samples} samples.")
-                unet_class_labels_gen = unet_class_labels_gen.repeat(
-                    num_samples, 1
-                )
-            else:
-                raise ValueError(
-                    f"Batch size of cond_input ({cond_input_tensor.shape[0]}) "
-                    f"does not match num_samples ({num_samples}) "
-                    f"and cannot be broadcasted."
-                )
-
-    with torch.no_grad():
-        for i in tqdm(range(num_inference_steps), desc="Sampling (EDM-FM)"):
-            t_current = t_steps[i]
-            dt = t_steps[i+1] - t_current
-
-            # Replicate t_current for batch
-            t_batch = torch.full((num_samples,), t_current.item(), device=device)
-
-            sigma = edm_params['sigma_max'] * \
-                    (edm_params['sigma_min'] / edm_params['sigma_max']) ** t_batch
-
-            sigma_b = sigma.view(-1, 1, 1, 1)
-            c_in_val = 1 / (edm_params['sigma_data']**2 + sigma_b**2).sqrt()
-            unet_noise_labels = (sigma.log() / 4).flatten()
-
-            v = unet_model(
-                x=x * c_in_val,
-                noise_labels=unet_noise_labels,
-                class_labels=unet_class_labels_gen,
-                augment_labels=None
-            )
-
-            x = x + v * dt # Euler step
-
-            if (i + 1) % max(num_inference_steps // 10, 1) == 0 or \
-               i == num_inference_steps - 1:
-                trajectory.append(x.detach().float().cpu())
-
-    unet_model.train() # Set back to train mode
-    return x.detach().float().cpu(), trajectory
-
 # --- Improved Learning Rate Grouping for SongUNet ---
 def create_songunet_lr_groups(
     song_unet_model: nn.Module,
@@ -577,10 +180,15 @@ def create_songunet_lr_groups(
     for name, param in song_unet_model.named_parameters():
         if not param.requires_grad:
             continue
+        new_name = name
+        # support for compiled models
+        if name.startswith("_orig_mod."):
+            # Strip the prefix
+            new_name = name[len("_orig_mod."):]
 
-        is_output = name in output_param_names_exact
+        is_output = new_name in output_param_names_exact
         is_time_embed = any(
-            re.match(p, name) for p in time_embed_patterns_regex
+            re.match(p, new_name) for p in time_embed_patterns_regex
         )
 
         if is_output:
@@ -664,141 +272,6 @@ def create_songunet_lr_groups(
     return param_groups
 
 
-def save_images_for_fid(
-    images_tensor: torch.Tensor, # (B, C, H, W), range [-1, 1] float
-    output_dir: str,
-    start_idx: int = 0,
-    file_prefix: str = "sample"
-):
-    """Saves a batch of image tensors as PNG files for FID calculation."""
-    os.makedirs(output_dir, exist_ok=True)
-    # Denormalize from [-1, 1] to [0, 1], then to [0, 255] uint8
-    images_tensor = (images_tensor + 1) / 2.0
-    images_tensor = images_tensor.mul(255).add_(0.5).clamp_(0, 255)
-    images_tensor = images_tensor.permute(0, 2, 3, 1).to('cpu', torch.uint8)
-    images_np = images_tensor.numpy()
-
-    for i, img_np_chw in enumerate(images_np):
-        # img_np_chw is (H, W, C)
-        if img_np_chw.shape[-1] == 1: # Grayscale
-            img_pil = Image.fromarray(img_np_chw[..., 0], mode='L')
-        else: # RGB
-            img_pil = Image.fromarray(img_np_chw, mode='RGB')
-        
-        filename = f"{file_prefix}_{start_idx + i:06d}.png"
-        img_pil.save(os.path.join(output_dir, filename))
-
-def calculate_fid_stats_for_path(
-    image_path: str,
-    inception_model: torch.nn.Module, # Now directly takes the model
-    num_expected: int,
-    device: torch.device,
-    batch_size: int = 64,
-    num_workers: int = 2,
-    prefetch_factor: int = 2,
-    seed: int = 0, 
-):
-    """
-    Calculates Inception statistics (mu, sigma) for images in a directory.
-    Requires edm_dataset to be available.
-    """
-    if edm_dataset is None:
-        raise ImportError(
-            "training.dataset (from EDM) not available. "
-            "Cannot calculate FID stats for path."
-        )
-    if inception_model is None:
-        raise ValueError("Inception model not provided to "
-                         "calculate_fid_stats_for_path.")
-
-    feature_dim = 2048 
-    detector_kwargs = dict(return_features=True)
-
-    print(f'Loading images for FID from "{image_path}"...')
-    dataset_obj = edm_dataset.ImageFolderDataset(
-        path=image_path,
-        max_size=num_expected,
-        random_seed=seed,
-        use_labels=False, 
-        resolution=None 
-    )
-    if len(dataset_obj) < num_expected:
-        print(f"Warning: Found {len(dataset_obj)} images, "
-              f"but expected {num_expected}.")
-    if len(dataset_obj) < 2:
-        raise ValueError(f"Need at least 2 images to compute FID stats, "
-                         f"found {len(dataset_obj)}")
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset_obj,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        shuffle=False, # Order doesn't matter for stats
-        drop_last=False
-    )
-
-    mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
-    sigma = torch.zeros([feature_dim, feature_dim],
-                        dtype=torch.float64, device=device)
-    
-    inception_model.eval() # Ensure model is in eval mode
-
-    print(f'Calculating Inception stats for {len(dataset_obj)} images...')
-    total_processed = 0
-    for images, _labels in tqdm(data_loader, desc="FID Stats"):
-        if images.shape[0] == 0:
-            continue
-        
-        # Ensure images are 3-channel (repeat grayscale if necessary)
-        if images.shape[1] == 1:
-            images = images.repeat([1, 3, 1, 1])
-        
-        # Images from edm_dataset.ImageFolderDataset are already [-1, 1]
-        features = inception_model(
-            images.to(device), **detector_kwargs
-        ).to(torch.float64)
-        
-        mu += features.sum(0)
-        sigma += features.T @ features
-        total_processed += images.shape[0]
-
-    mu /= total_processed
-    sigma -= torch.outer(mu, mu) * total_processed
-    sigma /= (total_processed - 1) if total_processed > 1 else 1
-    
-    return mu.cpu().numpy(), sigma.cpu().numpy()
-
-def calculate_fid_score(
-    mu_gen: np.ndarray,
-    sigma_gen: np.ndarray,
-    ref_stats_path: str
-) -> float:
-    """Calculates FID score given generated and reference stats."""
-    print(f'Loading reference FID stats from "{ref_stats_path}"...')
-    try:
-        with np.load(ref_stats_path) as ref_data:
-            mu_ref = ref_data['mu']
-            sigma_ref = ref_data['sigma']
-    except Exception as e:
-        print(f"Error loading reference FID stats: {e}")
-        raise
-
-    m = np.square(mu_gen - mu_ref).sum()
-    # Note: scipy.linalg.sqrtm can be slow and numerically unstable.
-    # Consider adding epsilon to diagonal of sigma for stability if issues arise.
-    s, _ = scipy.linalg.sqrtm(
-        sigma_gen @ sigma_ref, disp=False
-    ) 
-    
-    # If sqrtm returns complex numbers, take the real part
-    if np.iscomplexobj(s):
-        s = np.real(s)
-
-    fid = m + np.trace(sigma_gen + sigma_ref - 2 * s)
-    return float(np.real(fid))
-
-
 def train_flow_matching_edm_with_songunet(
     # model is the raw SongUNet instance
     model: torch.nn.Module,
@@ -823,6 +296,7 @@ def train_flow_matching_edm_with_songunet(
     wandb_entity: str = None,
     log_config: dict = None, # For logging hyperparameters
     inception_model: torch.nn.Module = None, # Pass pre-loaded model
+    fid_ref=None,
     fid_eval_epochs: int = 0, # Default to 0 (disabled)
     fid_num_samples: int = 10000, 
     fid_gen_batch_size: int = 64, 
@@ -859,33 +333,22 @@ def train_flow_matching_edm_with_songunet(
         entity=wandb_entity
     )
 
+    # Define custom metrics after wandb initialization
     if logging_utils.is_wandb_initialized():
-        # Define "epoch" as a custom x-axis.
-        # Metrics associated with it will be plotted against 'epoch'.
-        wandb.define_metric("epoch") 
-        
-        # Metrics that will use 'epoch' as their x-axis
+        # Define custom x-axes for different metric types
+        wandb.define_metric("epoch")
+        wandb.define_metric("eval_step") 
+                
+        # Epoch-level metrics use epoch as x-axis
         wandb.define_metric("train/avg_epoch_loss", step_metric="epoch")
         wandb.define_metric("eval/fid_score", step_metric="epoch")
-        # Images logged per epoch will also use 'epoch' as their step.
-        # The step value passed to wandb.log or log_image for these
-        # should be the epoch number.
-        wandb.define_metric(
-            "epoch_samples/*", step_metric="epoch", step_sync=True
-        )
-
-        # Define "eval_step" as a custom x-axis for metrics logged
-        # at each evaluation interval.
-        wandb.define_metric("eval_step") # Defines 'eval_step' as an x-axis
-
-        # Metrics that will use 'eval_step' as their x-axis
+        wandb.define_metric("epoch_samples/*", step_metric="epoch")
+        
+        # Evaluation interval metrics use eval_step as x-axis
         wandb.define_metric("eval/avg_val_loss", step_metric="eval_step")
-        wandb.define_metric(
-            "train/avg_loss_interval", step_metric="eval_step"
-        )
-        wandb.define_metric(
-            "eval/epoch_progress_at_eval", step_metric="eval_step"
-        )
+        wandb.define_metric("train/avg_loss_interval", step_metric="eval_step")
+        wandb.define_metric("eval/epoch_progress_at_eval", 
+                           step_metric="eval_step")
 
 
     # Infer label_dim from the SongUNet model
@@ -974,7 +437,7 @@ def train_flow_matching_edm_with_songunet(
     best_eval_loss = float('inf')
     current_patience = 0
     global_step = 0
-    eval_log_step_count = 0 
+    eval_step_counter = 0 
     
     try:
         print(f"Starting Flow Matching training for SongUNet (EDM pre-trained)...")
@@ -1014,14 +477,6 @@ def train_flow_matching_edm_with_songunet(
 
                 loss.backward()
 
-                # Track gradient norms
-                # grads = [
-                #     param.grad.detach().flatten()
-                #     for param in model.parameters()
-                #     if param.grad is not None
-                # ]
-                # norm = torch.cat(grads).norm()
-
                 # returns the grad norm like the code above
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -1030,7 +485,6 @@ def train_flow_matching_edm_with_songunet(
 
                 epoch_loss_accum += loss.item()
                 num_batches_epoch += 1
-                global_step += 1
 
                 if logging_utils.is_wandb_initialized():
                     log_payload = {
@@ -1042,13 +496,13 @@ def train_flow_matching_edm_with_songunet(
                     for i, pg in enumerate(optimizer.param_groups):
                         log_payload[f"lr_group_{pg.get('name', i)}"] = pg['lr']
 
-                    logging_utils.log_metrics(log_payload, step=global_step, commit=True)
+                    logging_utils.log_metrics(log_payload, step=global_step, commit=False)
 
                 # Evaluation and logging
                 if (batch_idx + 1) % eval_interval == 0 or \
                    (batch_idx + 1) == len(train_loader):
                     # Increment custom step counter for evaluation logs
-                    eval_log_step_count += 1
+                    eval_step_counter += 1
                     avg_train_loss_interval = epoch_loss_accum / num_batches_epoch
                     
                     model.eval()
@@ -1072,7 +526,7 @@ def train_flow_matching_edm_with_songunet(
                     val_loss = val_loss / len(test_loader)
 
                     print(f"\nEpoch {epoch+1}, Batch {batch_idx+1}/"
-                          f"{len(train_loader)}, EvalStep {eval_log_step_count}: "
+                          f"{len(train_loader)}, EvalStep {eval_step_counter}: "
                           f"Train Loss Interval: {avg_train_loss_interval:.4f}, "
                           f"Val Loss: {val_loss:.4f}")
 
@@ -1082,9 +536,10 @@ def train_flow_matching_edm_with_songunet(
                         # Log eval metrics against custom 'eval_step'
                         logging_utils.log_metrics({
                             "eval/avg_val_loss": val_loss,
-                            "train/avg_loss_interval": avg_train_loss_interval, # noqa
-                            "eval/epoch_progress_at_eval": current_epoch_progress # noqa
-                        }, step=eval_log_step_count, commit=True) # Use eval_log_step_count
+                            "train/avg_loss_interval": avg_train_loss_interval,
+                            "eval/epoch_progress_at_eval": current_epoch_progress,
+                            "eval_step": eval_step_counter
+                        }, step=global_step, commit=False)
 
                     # Checkpointing and Early Stopping
                     if val_loss < best_eval_loss:
@@ -1096,24 +551,26 @@ def train_flow_matching_edm_with_songunet(
                         )
                         torch.save(model.state_dict(), save_path)
                         print(f"  -> New best val loss: {best_eval_loss:.4f}. Model saved to {save_path}")
-                        # if logging_utils.is_wandb_initialized():
-                        #     wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
+                        if logging_utils.is_wandb_initialized():
+                            wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
                     else:
                         current_patience += 1
                         if current_patience >= patience:
                             print(f"Early stopping triggered after {patience} evaluations without improvement.")
                             if logging_utils.is_wandb_initialized():
-                                logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step+1)
+                                logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step)
                             raise StopIteration # Use custom exception or break
                     model.train()
-            
+                global_step += 1
+
             # --- End of Epoch ---
             avg_epoch_loss = epoch_loss_accum / num_batches_epoch if num_batches_epoch > 0 else float('inf')
             print(f"End of Epoch {epoch+1}/{epochs}: Avg Train Loss: {avg_epoch_loss:.4f}")
             if logging_utils.is_wandb_initialized():
                 logging_utils.log_metrics({
                     "train/avg_epoch_loss": avg_epoch_loss,
-                }, step=epoch + 1, commit=False)
+                    "epoch": epoch,
+                }, step=global_step, commit=False)
 
             # Generate and log samples at the end of each epoch
             if num_gen_samples_epoch_end > 0:
@@ -1167,11 +624,6 @@ def train_flow_matching_edm_with_songunet(
 
                     full_plot_path = os.path.join(save_dir, trajectory_plot_filename)
 
-                    # saved_plot_path = plot_generation_steps(
-                    #     traj, num_images_to_show=min(8, actual_num_samples_to_gen), # Show up to 8 images in the plot
-                    #     filename=full_plot_path,
-                    #     title=f"FM Samples Epoch {epoch+1}"
-                    # )
                     saved_plot_path = plot_generation_steps_with_grid(
                         traj, 
                         batch_labels=gen_labels,
@@ -1179,30 +631,11 @@ def train_flow_matching_edm_with_songunet(
                         filename=full_plot_path,
                         title=f"FM Generation Results - Epoch {epoch+1}",
                         epoch=epoch+1,
-                        eval_interval=eval_log_step_count,  # Use your actual eval_interval here
+                        eval_interval=eval_step_counter, 
                         gridw=8, 
                         gridh=8)
 
                     if saved_plot_path and logging_utils.is_wandb_initialized():
-                        # logging_utils.log_image(
-                        #     "epoch_samples/generation_trajectory",
-                        #     saved_plot_path,
-                        #     caption=f"Trajectory at Epoch {epoch+1}",
-                        #     step=epoch+1,
-                        #     commit=False
-                        # )
-                        # Log individual final images as well for easier viewing
-                        # final_images_to_log = min(images.size(0), 16) # Log up to 16 final images
-                        # for i in range(final_images_to_log):
-                        #     img_to_log = (images[i].permute(1,2,0).numpy() + 1) / 2 # Denorm HWC
-                        #     img_to_log = np.clip(img_to_log, 0, 1)
-                        #     logging_utils.log_image(
-                        #         f"epoch_samples/final_sample_{i}",
-                        #         img_to_log,
-                        #         caption=f"Final Sample {i} Epoch {epoch+1} Label: {gen_labels[i].item() if gen_labels is not None and i < len(gen_labels) else 'N/A'}",
-                        #         step=epoch+1,
-                        #         commit=False
-                        #     )
                         # Log trajectory and grid separately if they exist
                         traj_path = saved_plot_path.replace('.png', '_trajectory.png')
                         grid_path = saved_plot_path.replace('.png', '_grid.png')
@@ -1212,8 +645,7 @@ def train_flow_matching_edm_with_songunet(
                                 "epoch_samples/generation_trajectory",
                                 traj_path,
                                 caption=f"Trajectory at Epoch {epoch+1}",
-                                step=epoch+1,
-                                commit=False
+                                step=global_step,
                             )
                         
                         if os.path.exists(grid_path):
@@ -1221,123 +653,50 @@ def train_flow_matching_edm_with_songunet(
                                 "epoch_samples/grid",
                                 grid_path,
                                 caption=f"Generated Grid at Epoch {epoch+1}",
-                                step=epoch+1,
-                                commit=False
+                                step=global_step,
                             )
 
-            
-                perform_fid = (
-                    fid_ref_path and 
-                    inception_model is not None and # Check if model was passed
-                    edm_dataset is not None and # Check if edm_dataset is available
-                    (epoch + 1) % fid_eval_epochs == 0 and 
-                    fid_num_samples > 0 and
-                    fid_eval_epochs > 0 # Ensure fid_eval_epochs is positive
+        
+            perform_fid = (
+                fid_ref_path and 
+                inception_model is not None and # Check if model was passed
+                (epoch + 1) % fid_eval_epochs == 0 and 
+                fid_num_samples > 0 and
+                fid_eval_epochs > 0 # Ensure fid_eval_epochs is positive
+            )
+
+            if perform_fid:
+                evaluate_fid(
+                    model=model,
+                    epoch=epoch,
+                    global_step=global_step,
+                    fid_ref=fid_ref,
+                    inception_model=inception_model,
+                    logging_utils=logging_utils,
+                    fid_num_samples=fid_num_samples,
+                    fid_gen_batch_size=fid_gen_batch_size,
+                    fid_inception_batch_size=fid_inception_batch_size,
+                    fid_num_workers=fid_num_workers,
+                    # Model and generation parameters
+                    model_label_dim=model_label_dim,
+                    device=device,
+                    seed=seed,
+                    num_inference_steps_epoch_end=num_inference_steps_epoch_end,
+                    img_shape=img_shape,
+                    edm_params=edm_params,
+                    dtype=dtype
                 )
-
-                if perform_fid:
-                    print(f"Epoch {epoch+1}: Starting FID calculation with "
-                        f"{fid_num_samples} samples...")
-                    model.eval()
-                    fid_temp_dir = tempfile.mkdtemp()
-                    print(f"  Saving generated images for FID to: {fid_temp_dir}")
-                    
-                    generated_count = 0
-                    try:
-                        fid_gen_labels = None
-                        if model_label_dim > 0:
-                            pass # Labels handled per batch
-
-                        for i in tqdm(range(0, fid_num_samples, fid_gen_batch_size), # noqa
-                                    desc="Generating FID Samples"):
-                            current_batch_size = min(
-                                fid_gen_batch_size,
-                                fid_num_samples - generated_count
-                            )
-                            if current_batch_size <= 0:
-                                break
-
-                            batch_gen_labels = None
-                            if model_label_dim > 0:
-                                batch_gen_labels = torch.randint(
-                                    0, model_label_dim, (current_batch_size,),
-                                    device=device
-                                )
-                            
-                            fid_seed = seed + epoch + i if seed is not None else None
-                            batch_images, _ = generate_samples_edm_fm(
-                                model,
-                                num_samples=current_batch_size,
-                                cond_input=batch_gen_labels,
-                                device=device,
-                                num_inference_steps=num_inference_steps_epoch_end,
-                                img_shape=img_shape,
-                                edm_params=edm_params,
-                                seed=fid_seed,
-                                unet_label_dim=model_label_dim,
-                                dtype=dtype 
-                            )
-                            save_images_for_fid(
-                                batch_images, fid_temp_dir, 
-                                start_idx=generated_count
-                            )
-                            generated_count += current_batch_size
-                        
-                        print(f"  Generated {generated_count} samples for FID.")
-                        if generated_count >= 2: 
-                            mu_gen, sigma_gen = calculate_fid_stats_for_path(
-                                image_path=fid_temp_dir,
-                                inception_model=inception_model, # Use passed model
-                                num_expected=generated_count, 
-                                device=torch.device(device),
-                                batch_size=fid_inception_batch_size,
-                                num_workers=fid_num_workers
-                            )
-                            fid_score = calculate_fid_score(
-                                mu_gen, sigma_gen, fid_ref_path
-                            )
-                            print(f"  FID Score (Epoch {epoch+1}): {fid_score:.4f}")
-                            if logging_utils.is_wandb_initialized():
-                                logging_utils.log_metrics(
-                                    {"eval/fid_score": fid_score},
-                                    step=epoch+1,
-                                    commit=True
-                                )
-                        else:
-                            print("  Not enough samples generated for FID.")
-
-                    except ImportError as e_import:
-                        print(f"ImportError during FID: {e_import}. "
-                            "FID calculation skipped. Ensure EDM toolkit "
-                            "components are available.")
-                        if logging_utils.is_wandb_initialized():
-                            logging_utils.log_metrics(
-                                {"eval/fid_error_import": 1}, step=epoch+1
-                            )
-                    except Exception as e:
-                        print(f"Error during FID calculation: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        if logging_utils.is_wandb_initialized():
-                            logging_utils.log_metrics(
-                                {"eval/fid_error_runtime": 1}, step=epoch+1
-                            )
-                    finally:
-                        print(f"  Cleaning up FID temp directory: {fid_temp_dir}")
-                        shutil.rmtree(fid_temp_dir)
-                        model.train() 
-                elif (epoch + 1) % fid_eval_epochs == 0 and fid_eval_epochs > 0:
-                    # Log why FID was skipped if it was supposed to run
-                    reason = []
-                    if not fid_ref_path: reason.append("fid_ref_path not set")
-                    if inception_model is None: reason.append("Inception model not loaded") # noqa
-                    if edm_dataset is None: reason.append("edm_dataset not available") # noqa
-                    if fid_num_samples <= 0: reason.append("fid_num_samples <= 0")
-                    print(f"FID calculation skipped for epoch {epoch+1}. "
-                        f"Reasons: {', '.join(reason) if reason else 'Unknown'}.")
+            elif (epoch + 1) % fid_eval_epochs == 0 and fid_eval_epochs > 0:
+                # Log why FID was skipped if it was supposed to run
+                reason = []
+                if not fid_ref_path: reason.append("fid_ref_path not set")
+                if inception_model is None: reason.append("Inception model not loaded")
+                if fid_num_samples <= 0: reason.append("fid_num_samples <= 0")
+                print(f"FID calculation skipped for epoch {epoch+1}. "
+                    f"Reasons: {', '.join(reason) if reason else 'Unknown'}.")
 
 
-                model.train() # Back to training mode
+            model.train() # Back to training mode
 
             # Save epoch checkpoint (optional, can be frequent)
             epoch_save_path = os.path.join(
@@ -1345,10 +704,11 @@ def train_flow_matching_edm_with_songunet(
                 f"edm_fm_epoch_{epoch+1}.pt"
             )
             torch.save(model.state_dict(), epoch_save_path)
-            # if logging_utils.is_wandb_initialized():
-            #      wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
+            if logging_utils.is_wandb_initialized():
+                 wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
 
         print("Training finished normally.")
+        logging_utils.log_metrics({}, step=global_step, commit=True)
 
 
     except StopIteration: # Handles early stopping

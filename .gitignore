@@ -9,3 +9,5 @@ train.py
 generate.py
 *.yml
 example.py
+wandb/
+data/
