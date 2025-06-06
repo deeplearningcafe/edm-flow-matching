@@ -136,6 +136,60 @@ def flow_matching_step(
     loss = F.mse_loss(v_pred, v_true, reduction="mean")
     return loss
 
+def flow_matching_step_min_rf(
+    unet_model: torch.nn.Module,
+    x1: torch.Tensor,
+    cond_input: torch.Tensor,
+    edm_params: dict = None,
+    unet_label_dim: int = 0,
+    dtype=torch.float32,
+    use_custom_unet=False
+):
+    if edm_params is None:
+        edm_params = {
+            'sigma_min': 0.002, 'sigma_max': 80.0, 'sigma_data': 0.5
+        }
+
+    batch_size = x1.shape[0]
+
+    nt = torch.randn((batch_size,)).to(x1.device)
+    t = torch.sigmoid(nt)
+
+    texp = t.view([batch_size, *([1] * len(x1.shape[1:]))])
+    x0 = torch.randn_like(x1)
+    xt = (1 - texp) * x0 + texp * x1
+
+
+    sigma = edm_params['sigma_max'] * \
+            (edm_params['sigma_min'] / edm_params['sigma_max']) ** t
+    sigma_b = sigma.view([batch_size, *([1] * len(x1.shape[1:]))])
+    c_in_val = 1 / (edm_params['sigma_data']**2 + sigma_b**2).sqrt()
+    unet_noise_labels = (sigma.log() / 4).flatten() # Should be (B,)
+    
+    if not use_custom_unet:
+        unet_class_labels = None
+        if unet_label_dim > 0:
+                if cond_input is None:
+                    raise ValueError("cond_input is None but unet_label_dim > 0.")
+                unet_class_labels = F.one_hot(
+                    cond_input.long(), num_classes=unet_label_dim
+                ).to(dtype)
+
+        v_pred = unet_model(
+            x=xt * c_in_val,
+            noise_labels=unet_noise_labels,
+            class_labels=unet_class_labels,
+            augment_labels=None
+        )
+    else:
+        v_pred = unet_model(
+            xt * c_in_val,
+            unet_noise_labels,
+            encoder_hidden_states=cond_input.long().unsqueeze(-1).unsqueeze(-1),
+        )
+    batchwise_mse = ((x1 - x0 - v_pred) ** 2).mean(dim=list(range(1, len(x1.shape))))
+    return batchwise_mse.mean()
+
 # --- Improved Learning Rate Grouping for SongUNet ---
 def create_songunet_lr_groups(
     song_unet_model: nn.Module,
@@ -302,7 +356,8 @@ def train_flow_matching_edm_with_songunet(
     fid_gen_batch_size: int = 64, 
     fid_inception_batch_size: int = 64, 
     fid_ref_path: str = None, 
-    fid_num_workers: int = 2   
+    fid_num_workers: int = 2,
+    use_custom_unet=False,
 ):
     if edm_params is None:
         edm_params = {
@@ -453,17 +508,27 @@ def train_flow_matching_edm_with_songunet(
                 x1_batch = batch[0].to(dtype=dtype).to(device)
                 cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
 
-                loss = flow_matching_step(
+                # loss = flow_matching_step(
+                #     unet_model=model,
+                #     x1=x1_batch,
+                #     cond_input=cond_input_batch,
+                #     generator=generator,
+                #     input_perturbation=True, # Often good for FM
+                #     edm_params=edm_params,
+                #     unet_label_dim=model_label_dim,
+                #     dtype=dtype
+                # )
+                loss = flow_matching_step_min_rf(
                     unet_model=model,
                     x1=x1_batch,
                     cond_input=cond_input_batch,
-                    generator=generator,
-                    input_perturbation=True, # Often good for FM
                     edm_params=edm_params,
                     unet_label_dim=model_label_dim,
-                    dtype=dtype
+                    dtype=dtype,
+                    use_custom_unet=use_custom_unet
                 )
 
+                # it calls cudaStreamSynchronize but there is not performance diff also this torch ops should be on gpu
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"Warning: NaN/Inf loss detected at step {global_step}. Skipping batch.")
                     # Optionally, try to recover or stop training
@@ -511,15 +576,14 @@ def train_flow_matching_edm_with_songunet(
                         for batch in tqdm(test_loader, desc="Evaluating", leave=False):
                             x1_batch = batch[0].to(dtype=dtype).to(device)
                             cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
-                            loss = flow_matching_step(
+                            loss = flow_matching_step_min_rf(
                                 unet_model=model,
                                 x1=x1_batch,
                                 cond_input=cond_input_batch,
-                                generator=None, # No specific generator for eval
-                                input_perturbation=False, # No perturbation for eval
                                 edm_params=edm_params,
                                 unet_label_dim=model_label_dim,
-                                dtype=dtype
+                                dtype=dtype,
+                                use_custom_unet=use_custom_unet
                             )
                             val_loss += loss.item()
 

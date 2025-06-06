@@ -11,3 +11,6 @@ generate.py
 example.py
 wandb/
 data/
+my_profiler_traces/
+report*
+*.ipynb

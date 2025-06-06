@@ -12,6 +12,7 @@ try:
         create_aligned_stl10_test_dataloader
     )
     from training.fm import train_flow_matching_edm_with_songunet
+    from training.networks import Unet, UnetConfig, weights_init
 except ImportError:
     # Fallback if they are in the same directory or top-level
     from training.dataset import (
@@ -94,6 +95,18 @@ def load_inception_model(
               "FID calculation will be disabled.")
         return inception_model, None
 
+def unet_model_custom():
+    config = UnetConfig() # Uses defaults: 4 blocks, 64 init channels, etc.
+
+    # Instantiate custom Unet model
+    unet_model = Unet(config)
+    unet_model.apply(weights_init)
+
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"Trainable parameters in unet (net.model): {count_parameters(unet_model)}")
+    return unet_model
 
 def train(
         network_pkl='https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl',
@@ -119,8 +132,8 @@ def train(
         fid_gen_batch_size: int = 64,
         fid_inception_batch_size: int = 64,
         fid_ref_path: str = None, # e.g., "fid-refs/cifar10-32x32.npz"
-        fid_num_workers: int = 2
-
+        fid_num_workers: int = 2,
+        use_custom_unet=False
 ):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -150,8 +163,11 @@ def train(
     print()
     
     # Load model (U-Net part)
-    # The load_trainable_model now returns the unet directly
-    unet_model = load_trainable_model(network_pkl, device, dtype=dtype)
+    if not use_custom_unet:
+        # The load_trainable_model now returns the unet directly
+        unet_model = load_trainable_model(network_pkl, device, dtype=dtype)
+    else:
+        unet_model = unet_model_custom()
     
     inception_model_instance = None
     if fid_eval_epochs > 0 and fid_ref_path:
@@ -220,7 +236,8 @@ def train(
         "fid_gen_batch_size": fid_gen_batch_size,
         "fid_inception_batch_size": fid_inception_batch_size,
         "fid_ref_path": fid_ref_path,
-        "fid_num_workers": fid_num_workers
+        "fid_num_workers": fid_num_workers,
+        "use_custom_unet": use_custom_unet
     }
 
     # Finetune
@@ -253,7 +270,8 @@ def train(
         fid_gen_batch_size=fid_gen_batch_size,
         fid_inception_batch_size=fid_inception_batch_size,
         fid_ref_path=fid_ref_path,
-        fid_num_workers=fid_num_workers
+        fid_num_workers=fid_num_workers,
+        use_custom_unet=use_custom_unet
     )
     print("Finetuning process finished.")
 
@@ -269,7 +287,7 @@ if __name__ == '__main__':
     train(
         network_pkl=cifar10_edm_pkl,
         dataset_name="cifar10",
-        batch_size=32, # Adjust based on VRAM
+        batch_size=16, # Adjust based on VRAM
         learning_rate=5e-5,
         epochs=5, # For a quick test
         eval_interval=100000, # Evaluate more frequently for small datasets
@@ -286,7 +304,8 @@ if __name__ == '__main__':
         fid_gen_batch_size=16,
         fid_inception_batch_size=16,
         fid_ref_path=cifar10_fid_ref_path, # Path to CIFAR10 FID stats
-        fid_num_workers=2 # Simpler for small test
+        fid_num_workers=2, # Simpler for small test
+        use_custom_unet=False,
     )
 
     # To run STL10 finetuning (your main goal for distribution shift)

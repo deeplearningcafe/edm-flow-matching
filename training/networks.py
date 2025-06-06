@@ -671,3 +671,660 @@ class EDMPrecond(torch.nn.Module):
         return torch.as_tensor(sigma)
 
 #----------------------------------------------------------------------------
+import math
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import re
+from dataclasses import dataclass
+from typing import ClassVar
+import random
+import numpy as np
+torch.manual_seed(46)
+random.seed(46)
+np.random.seed(46)
+
+class ResnetBlock(nn.Module):
+
+    def __init__(self, input_channels, output_channels, time_embeddings, num_groups, eps):
+        super().__init__()
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.time_embeddings = time_embeddings
+        self.num_groups = num_groups
+        self.eps = eps
+
+        self.norm1 = nn.GroupNorm(num_groups=self.num_groups,
+                            num_channels=self.input_channels,
+                            eps=self.eps)
+        self.conv1 = nn.Conv2d(in_channels=self.input_channels, out_channels=self.output_channels,
+                            kernel_size=3, stride=1, padding=1, bias=True)
+        self.nonlinearity = nn.SiLU()
+        self.time_emb_proj = nn.Linear(in_features=self.time_embeddings,
+                                            out_features=self.output_channels, bias=True)
+        self.norm2 = nn.GroupNorm(num_groups=self.num_groups,
+                            num_channels=self.output_channels,
+                            eps=self.eps)
+        self.conv2 = nn.Conv2d(in_channels=self.output_channels, out_channels=self.output_channels,
+                            kernel_size=3, stride=1, padding=1, bias=True)
+
+        use_conv_shortcut = True if input_channels != output_channels else False
+        self.conv_shortcut = None
+        if use_conv_shortcut:
+            self.conv_shortcut = nn.Conv2d(in_channels=self.input_channels,
+                                                out_channels=self.output_channels, kernel_size=1,
+                                                stride=1, padding=0, bias=True)
+
+    def forward(self, x, temb):
+        hidden_states = x # Start with input for residual connection
+
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.conv1(hidden_states)
+
+        temb = self.nonlinearity(temb)
+        temb = self.time_emb_proj(temb)[:, :, None, None]
+        hidden_states = hidden_states + temb
+
+        hidden_states = self.norm2(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.conv2(hidden_states)
+
+        if self.conv_shortcut is not None:
+            x = self.conv_shortcut(x)
+
+        hidden_states = hidden_states + x
+
+        return hidden_states
+
+class UpsamplerBlock(nn.Module):
+
+    def __init__(self, input_channels, output_channels):
+        super().__init__()
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.conv = nn.Conv2d(in_channels=input_channels, out_channels=output_channels,
+                        kernel_size=3, stride=1, padding=1, bias=True)
+
+    def forward(self, x):
+        # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984()
+        scale_factor = 2.0
+        if x.numel() * scale_factor > pow(2, 31) or x.shape[0] >= 64:
+            x = x.contiguous()
+        x = F.interpolate(x, scale_factor=scale_factor, mode="nearest")
+        x = self.conv(x)
+
+        return x
+
+class TimeEmbeddings(nn.Module):
+    """
+    Calculates sinusoidal embeddings and projects them.
+    Matches diffusers Timesteps + TimestepEmbedding structure.
+    """
+    def __init__(self,
+                 sinusoidal_dim: int,
+                 output_dim: int,
+                 max_period=10000):
+        super().__init__()
+        self.sinusoidal_dim = sinusoidal_dim
+        self.output_dim = output_dim
+        if sinusoidal_dim % 2 != 0:
+            raise ValueError(
+                f"Cannot use sinusoidal dim {sinusoidal_dim}, "
+                f"must be even."
+            )
+        half_dim = sinusoidal_dim // 2
+        # we need to include the device in the init as this precomputations only
+        # work without error in cuda
+        exponent = -math.log(max_period) * torch.arange(
+            start=0, end=half_dim, dtype=torch.float32, device="cuda"
+        )
+        exponent = exponent / half_dim
+        # Store as 'inv_freq' (inverse frequencies scaled)
+        # Shape: [half_dim]
+        self.register_buffer(
+            'inv_freq', torch.exp(exponent), persistent=False
+        )
+
+        # Layers for projection, matching diffusers' TimestepEmbedding
+        self.linear_1 = nn.Linear(sinusoidal_dim, output_dim)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(output_dim, output_dim)
+
+    def _get_sinusoidal_embeddings(self, timesteps: torch.Tensor):
+        """Calculates the base sinusoidal embeddings."""
+        assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+
+        # Output of multiplication: [batch_size, half_dim]
+        emb = timesteps[:, None].float() * self.inv_freq[None, :]
+
+        # concat sine and cosine embeddings
+        # Shape: [batch_size, sinusoidal_dim]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+
+        # Optional: Flip sin and cosine (matches provided code)
+        # Note: Standard diffusers might just concat sin(first half)
+        # and cos(second half) differently. Verify if exact
+        # replication is needed.
+        half_dim = self.sinusoidal_dim // 2
+        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+
+
+        # print(f"Check emb flip cosine {torch.norm(emb-emb_flip)}") huge
+        # Zero pad if sinusoidal_dim is odd
+        if self.sinusoidal_dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+
+        return emb
+
+    def forward(self, timesteps: torch.Tensor, sample:torch.Tensor):
+        # 1. Calculate sinusoidal embeddings
+        if len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+        sin_emb = self._get_sinusoidal_embeddings(timesteps)
+        # `Timesteps` does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        sin_emb = sin_emb.to(dtype=sample.dtype)
+
+
+        # 2. Project embeddings (matches diffusers TimestepEmbedding)
+        emb = self.linear_1(sin_emb)
+        emb = self.act(emb)
+        emb = self.linear_2(emb)
+        return emb
+
+class Attention(nn.Module):
+
+    def __init__(self, input_channels, n_head, cross_attention_dim=None,
+                 qv_norm:str=None):
+        super().__init__()
+        self.input_channels = input_channels
+        self.n_head = n_head
+        self.cross_attention_dim = input_channels
+        if cross_attention_dim:
+            self.cross_attention_dim = cross_attention_dim
+
+        dim_head = input_channels//self.n_head
+        if qv_norm == "rms_norm":
+            self.norm_q = nn.RMSNorm(dim_head, eps=1e-6)
+            # k has the same C as Q and V because the to_k and to_v
+            self.norm_k = nn.RMSNorm(dim_head, eps=1e-6)
+        else:
+          self.norm_q = None
+          self.norm_k = None
+
+        self.to_q = nn.Linear(self.input_channels, self.input_channels, bias=False)
+        self.to_k = nn.Linear(self.cross_attention_dim, self.input_channels, bias=False)
+        self.to_v = nn.Linear(self.cross_attention_dim, self.input_channels, bias=False)
+
+        self.to_out = nn.Linear(self.input_channels, self.input_channels, bias=True)
+
+    def forward(self, x, encoder_hidden_states=None):
+        # the input is [B, C, H, W]
+        B, T, C = x.shape
+        # print(f"Attn in shape { x.shape}")
+        q = self.to_q(x)
+
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else x
+        k = self.to_k(encoder_hidden_states)
+        v = self.to_v(encoder_hidden_states)
+
+        # q [B, H*W, C], k [B, T, C],
+        q = q.view(B, -1, self.n_head, C//self.n_head).transpose(1, 2)
+        k = k.view(B, -1, self.n_head, C//self.n_head).transpose(1, 2)
+        v = v.view(B, -1, self.n_head, C//self.n_head).transpose(1, 2)
+        # print(f"Q shape {q.shape} and k shape {k.shape}")
+        if self.norm_q is not None:
+            q = self.norm_q(q)
+        if self.norm_k is not None:
+            k = self.norm_k(k)
+
+        x = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # attn [B, H*W, NH, NDIM]
+        x = x.transpose(1, 2).contiguous().view(B, -1, C)
+
+        x = self.to_out(x)
+
+        return x
+
+class GEGLU(nn.Module):
+    r"""
+    A [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function.
+
+    Parameters:
+        dim_in (`int`): The number of channels in the input.
+        dim_out (`int`): The number of channels in the output.
+        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
+    """
+
+    def __init__(self, dim_in: int, dim_out: int, bias: bool = True):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2, bias=bias)
+
+    def gelu(self, gate: torch.Tensor) -> torch.Tensor:
+        return F.gelu(gate)
+
+    def forward(self, hidden_states, ):
+        hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
+        return hidden_states * self.gelu(gate)
+
+class MLP(nn.Module):
+
+    def __init__(self, input_channels):
+        super().__init__()
+
+        self.input_channels = input_channels
+        self.geglu = GEGLU(input_channels, 4*input_channels, bias=True)
+        self.proj_out = nn.Linear(input_channels*4, input_channels, bias=True)
+
+    def forward(self, x):
+        x = self.geglu(x)
+        x = self.proj_out(x)
+
+        return x
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(self, input_channels, cross_attention_dim, n_head, norm="LN",
+                 qv_norm=None):
+        super().__init__()
+        self.input_channels = input_channels
+        self.cross_attention_dim = cross_attention_dim
+        if norm == "LN":
+            self.norm1 = nn.LayerNorm((self.input_channels,))
+            self.norm2 = nn.LayerNorm((self.input_channels,))
+            self.norm3 = nn.LayerNorm((self.input_channels,))
+        elif norm =="RSM":
+            self.norm1 = nn.RMSNorm(self.input_channels, eps=1e-6)
+            self.norm2 = nn.RMSNorm(self.input_channels, eps=1e-6)
+            self.norm3 = nn.RMSNorm(self.input_channels, eps=1e-6)
+        else:
+            raise ValueError
+
+        self.attn1 = Attention(self.input_channels, n_head, qv_norm=qv_norm)
+        self.attn2 = Attention(self.input_channels, n_head,
+                               self.cross_attention_dim, qv_norm=qv_norm)
+
+        self.ff = MLP(self.input_channels)
+
+    def forward(self, x, encoder_hidden_states):
+        hidden_states = x + self.attn1(self.norm1(x))
+        hidden_states = hidden_states + self.attn2(self.norm2(hidden_states), encoder_hidden_states)
+        hidden_states = hidden_states + self.ff(self.norm3(hidden_states))
+
+        return hidden_states
+
+
+class AttentionBlock(nn.Module):
+
+    def __init__(self, input_channels, cross_attention_dim, n_head, num_groups,
+                 eps, norm="LN", qv_norm=None):
+        super().__init__()
+
+        assert input_channels % n_head == 0
+        self.input_channels = input_channels
+        self.cross_attention_dim = cross_attention_dim
+        self.num_groups = num_groups
+        self.eps = eps
+
+        self.norm = nn.GroupNorm(num_groups=self.num_groups,
+                            num_channels=self.input_channels,
+                            eps=1e-6)
+        self.proj_in = nn.Conv2d(in_channels=self.input_channels, out_channels=self.input_channels,
+                                kernel_size=1, stride=1, padding=0, bias=True)
+
+        self.transformer_blocks = nn.ModuleList([TransformerBlock(input_channels,
+                                              cross_attention_dim, n_head,
+                                              norm=norm, qv_norm=qv_norm)])
+
+        self.proj_out = nn.Conv2d(in_channels=self.input_channels, out_channels=self.input_channels,
+                                kernel_size=1, stride=1, padding=0, bias=True)
+
+    def forward(self, x, encoder_hidden_states):
+        batch, _, height, width = x.shape
+        res = x
+        # prepare continuous input for transformers
+        x = self.norm(x)
+        x = self.proj_in(x)
+        inner_dim = x.shape[1]
+        x = x.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+
+        for block in self.transformer_blocks:
+            x = block(x, encoder_hidden_states)
+
+        # prepare output
+        x = x.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+        x = self.proj_out(x)
+        x = x + res
+
+        return x
+
+@dataclass
+class UnetConfig:
+    in_channels: int = 3
+    out_channels: int = 3
+    block_out_channels: ClassVar[list[int]] = [128, 256, 256, 256]
+    cross_attention_dim: int = 512
+    num_blocks: int = 4
+    attention_head_dim: int = 8
+    layers_per_block: int = 2
+    norm_num_groups: int = 32
+    norm_eps: int = 1e-05
+    num_classes: int = 10
+    norm: str="LN"
+    qv_norm: str=None
+
+class Unet(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        block_out_channels = config.block_out_channels
+        time_embed_dim = block_out_channels[-1] # Usually time dim matches max channels
+        self.in_channels = config.in_channels
+        self.class_embedding = nn.Embedding(
+               config.num_classes, config.cross_attention_dim # e.g., 10 classes, 64 dim
+           )
+
+        # 1. Input Convolution
+        self.conv_in = nn.Conv2d(
+            config.in_channels,
+            block_out_channels[0],
+            kernel_size=3,
+            padding=1
+        )
+
+        # 2. Time Embedding
+        self.time_embedding = TimeEmbeddings(
+            sinusoidal_dim=block_out_channels[0],
+            output_dim=time_embed_dim,
+        )
+
+        # down_blocks is Resnet  ->  CrossAtten -> Downsample except last block is just Resnet
+        # is the AttentionBlock the one with the double the channels for the up block in the unet
+        # and is the resnet the one how changes the block channels
+        self.down_blocks = nn.ModuleList([])
+        output_channel = block_out_channels[0]
+        for i in range(config.num_blocks):
+            input_channel = output_channel
+            output_channel = block_out_channels[i]
+            is_final_block = i == config.num_blocks - 1
+
+            # Create a regular ModuleList for resnets and attentions instead of ModuleDict
+            resnets = nn.ModuleList([])
+            attentions = nn.ModuleList([])
+
+            for j in range(config.layers_per_block):
+                # First resnet in block handles channel changes
+                res_input_channel = input_channel if j == 0 else output_channel
+                resnets.append(
+                    ResnetBlock(
+                        res_input_channel,
+                        output_channel,
+                        time_embed_dim,
+                        config.norm_num_groups,
+                        config.norm_eps
+                    )
+                )
+                # Add attention blocks except for the final block
+                if not is_final_block:
+                    attentions.append(
+                        AttentionBlock(
+                            output_channel,
+                            config.cross_attention_dim,
+                            config.attention_head_dim,
+                            config.norm_num_groups,
+                            config.norm_eps,
+                            config.norm,
+                            config.qv_norm
+                        )
+                    )
+
+            # Create a module dictionary for the entire block
+            down_block = nn.ModuleDict({
+                "resnets": resnets,
+                "attentions": attentions,
+            })
+
+            # Add downsamplers at the block level, not nested inside a ModuleList
+            if not is_final_block:
+                # Fixed: Use a direct Conv2d module, not wrapped in another ModuleList
+                down_block["downsamplers"] = nn.ModuleList([
+                    nn.Conv2d(
+                        output_channel, output_channel,
+                        kernel_size=3, stride=2, padding=1
+                    )
+                ])
+
+            self.down_blocks.append(down_block)
+
+        self.mid_block = nn.ModuleDict({
+            "resnets": nn.ModuleList([
+                ResnetBlock(
+                    block_out_channels[-1],
+                    block_out_channels[-1],
+                    time_embed_dim,
+                    config.norm_num_groups,
+                    config.norm_eps
+                ),
+                ResnetBlock(
+                    block_out_channels[-1],
+                    block_out_channels[-1],
+                    time_embed_dim,
+                    config.norm_num_groups,
+                    config.norm_eps
+                ),
+            ]),
+            "attentions": nn.ModuleList([
+                AttentionBlock(
+                    block_out_channels[-1],
+                    config.cross_attention_dim,
+                    config.attention_head_dim,
+                    config.norm_num_groups,
+                    config.norm_eps,
+                    config.norm,
+                    config.qv_norm
+                )
+            ])
+        })
+
+        # 5. Up Blocks
+        self.up_blocks = nn.ModuleList([])
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        output_channel = reversed_block_out_channels[0]
+        num_layers = config.layers_per_block + 1
+        for i in range(config.num_blocks):
+            prev_output_channel = output_channel#reversed_block_out_channels[max(i - 1, 0)]
+            output_channel = reversed_block_out_channels[i]
+            input_channel = reversed_block_out_channels[min(i + 1, len(reversed_block_out_channels) - 1)]
+
+            is_first_block = i == 0
+
+            # Create ModuleLists for resnets and attentions
+            resnets = nn.ModuleList([])
+            attentions = nn.ModuleList([])
+            # Fixed: Calculate skip connection channels correctly for each layer
+            for j in range(num_layers):
+                res_skip_channels = input_channel if (j == num_layers - 1) else output_channel
+                resnet_in_channels = prev_output_channel if j == 0 else output_channel
+                resnets.append(
+                    ResnetBlock(
+                        resnet_in_channels + res_skip_channels,
+                        output_channel,
+                        time_embed_dim,
+                        config.norm_num_groups,
+                        config.norm_eps
+                    )
+                )
+
+                # Add attention blocks (in up blocks they come after resnets)
+                if not is_first_block:
+                    attentions.append(
+                        AttentionBlock(
+                            output_channel,
+                            config.cross_attention_dim,
+                            config.attention_head_dim,
+                            config.norm_num_groups,
+                            config.norm_eps,
+                            config.norm,
+                            config.qv_norm
+                        )
+                    )
+
+            # Create module dictionary for the entire block
+            up_block = nn.ModuleDict({
+                "resnets": resnets,
+                "attentions": attentions
+            })
+
+            # Add upsamplers at the block level
+            if i < config.num_blocks - 1:  # No upsampler needed for the last block
+                up_block["upsamplers"] = nn.ModuleList([
+                    UpsamplerBlock(output_channel, output_channel)
+                ])
+
+            self.up_blocks.append(up_block)
+
+        # 6. Output Convolution
+        self.conv_norm_out = nn.GroupNorm(
+            num_groups=config.norm_num_groups,
+            num_channels=block_out_channels[0], # Final output channels match first block
+            eps=config.norm_eps
+        )
+        self.conv_act = nn.SiLU()
+        self.conv_out = nn.Conv2d(
+            block_out_channels[0],
+            config.out_channels,
+            kernel_size=3,
+            padding=1
+        )
+
+    def forward(self, x, timestep, encoder_hidden_states):
+        # class
+        encoder_hidden_states = self.class_embedding(encoder_hidden_states)
+        # 1. time
+        # t_emb = self.time_proj(timestep)
+        t_emb = self.time_embedding(timestep, x)
+        # 2. preprocess
+        x = self.conv_in(x)
+
+        # 3. down
+        down_block_res_x = (x,)
+
+        for i, downsample_block in enumerate(self.down_blocks):
+            output_states = ()
+            if i != (self.config.num_blocks-1):
+                for resnet, attention in zip(downsample_block.resnets, downsample_block.attentions):
+                    x = resnet(x, t_emb)
+                    x = attention(x, encoder_hidden_states)
+                    output_states += (x, )
+
+                for downsamplers in downsample_block.downsamplers:
+                    x = downsamplers(x)
+                output_states = output_states + (x,)
+
+            else:
+                for resnet in downsample_block.resnets:
+                    x =resnet(x, t_emb)
+                    output_states += (x, )
+
+            down_block_res_x += output_states
+
+        # 4. mid
+        x = self.mid_block.resnets[0](x, t_emb)
+        for attention, resnet,  in zip(self.mid_block.attentions, self.mid_block.resnets[1:]):
+            x = attention(x, encoder_hidden_states)
+            x = resnet(x, t_emb)
+
+        # 5. up
+        for i, upsample_block in enumerate(self.up_blocks):
+            # gets the last 3 outputs of the downblocks (the resnets)
+            res_x_tuple = down_block_res_x[-len(upsample_block.resnets):]
+            down_block_res_x = down_block_res_x[:-len(upsample_block.resnets)]
+            if i == 0:
+                for resnet in upsample_block.resnets:
+                    res_x = res_x_tuple[-1]
+                    res_x_tuple = res_x_tuple[:-1]
+                    x = torch.cat([x, res_x], dim=1)
+
+                    x = resnet(x, t_emb)
+
+                for upsampler in upsample_block.upsamplers:
+                    x = upsampler(x)
+
+            elif i == len(self.up_blocks)-1:
+                for resnet, attention in zip(upsample_block.resnets, upsample_block.attentions):
+                    res_x = res_x_tuple[-1]
+                    res_x_tuple = res_x_tuple[:-1]
+                    x = torch.cat([x, res_x], dim=1)
+
+                    x = resnet(x, t_emb)
+                    x = attention(x, encoder_hidden_states)
+
+            else:
+                for resnet, attention in zip(upsample_block.resnets, upsample_block.attentions):
+                    res_x = res_x_tuple[-1]
+                    res_x_tuple = res_x_tuple[:-1]
+                    x = torch.cat([x, res_x], dim=1)
+
+                    x = resnet(x, t_emb)
+                    x = attention(x, encoder_hidden_states)
+
+                for upsampler in upsample_block.upsamplers:
+                    x = upsampler(x)
+
+        # 6. post-process
+        x = self.conv_norm_out(x)
+        x = self.conv_act(x)
+        x = self.conv_out(x)
+        return x
+
+def weights_init(m, activation_type='relu', leaky_relu_slope=0.01):
+    """
+    Applies Kaiming initialization to convolutional and linear layers.
+    Initializes normalization layers appropriately.
+
+    Args:
+        m (nn.Module): The module to initialize.
+        activation_type (str): The type of nonlinearity used after conv/linear
+                               layers. Used by Kaiming init.
+                               Defaults to 'relu'. For SiLU/Swish or GELU
+                               activations, using 'relu' is a common and
+                               effective practice.
+        leaky_relu_slope (float): The negative slope for leaky_relu,
+                                  if 'leaky_relu' is chosen as
+                                  activation_type. Defaults to 0.01.
+    """
+    classname = m.__class__.__name__
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(
+            m.weight.data,
+            # 'a' is the negative slope for leaky_relu.
+            # It's ignored if nonlinearity is 'relu'.
+            a=leaky_relu_slope if activation_type == 'leaky_relu' else 0,
+            mode='fan_in',
+            nonlinearity=activation_type
+        )
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+    elif isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(
+            m.weight.data,
+            a=leaky_relu_slope if activation_type == 'leaky_relu' else 0,
+            mode='fan_in',
+            nonlinearity=activation_type
+        )
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+    elif isinstance(m, nn.Embedding):
+        nn.init.normal_(m.weight.data, mean=0.0, std=0.02)
+    elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.constant_(m.weight.data, 1.0)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
