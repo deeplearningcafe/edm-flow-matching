@@ -20,6 +20,8 @@ def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
     import PIL.Image
     
     batch_size = images.shape[0]
+    # images are already float from the generation function
+    images = images.float()
     if batch_size < gridw * gridh:
         # Pad with zeros if we don't have enough images
         padding = torch.zeros(
@@ -43,7 +45,7 @@ def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
     images = images.reshape(gridh * H, gridw * W, C)
     
     # Convert to PIL Image
-    images = images.cpu().numpy()
+    images = images.float().cpu().numpy()
     if C == 1:  # Grayscale
         images = images.squeeze(-1)
         return PIL.Image.fromarray(images, 'L')
@@ -125,7 +127,7 @@ def plot_generation_steps_with_grid(
                 img_tensor = trajectory[j][sample_idx]
                 
                 # Convert and denormalize
-                img = img_tensor.cpu().numpy()
+                img = img_tensor.float().cpu().numpy()
                 if img.shape[0] == 1:  # Grayscale
                     img = np.squeeze(img, axis=0)
                     img = (img + 1.0) / 2.0
@@ -240,7 +242,9 @@ def generate_samples_edm_fm(
     x = torch.randn(num_samples, *img_shape, device=device, dtype=dtype, **rand_kwargs)
 
     # Time steps for Euler solver (from t=0 to t=1)
-    t_steps = torch.linspace(0, 1, num_inference_steps + 1, device=device)
+    t_steps = torch.linspace(
+        0, 1, num_inference_steps + 1, device=device, dtype=dtype
+    )
     trajectory = [x.detach().cpu()]
 
     # Prepare `class_labels` for SongUNet for the entire batch
@@ -290,7 +294,7 @@ def generate_samples_edm_fm(
             dt = t_steps[i+1] - t_current
 
             # Replicate t_current for batch
-            t_batch = torch.full((num_samples,), t_current.item(), device=device)
+            t_batch = t_current.expand(num_samples)
 
             sigma = edm_params['sigma_max'] * \
                     (edm_params['sigma_min'] / edm_params['sigma_max']) ** t_batch

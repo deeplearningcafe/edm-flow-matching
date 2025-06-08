@@ -418,7 +418,8 @@ def create_aligned_stl10_dataloader(batch_size=64, num_workers=2):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=4
+        prefetch_factor=4,
+        persistent_workers=True if num_workers > 0 else False
     )
 
     return dataloader
@@ -459,7 +460,8 @@ def create_aligned_stl10_test_dataloader(batch_size=64, num_workers=2):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=4
+        prefetch_factor=4,
+        persistent_workers=True if num_workers > 0 else False
     )
 
     return test_dataloader

@@ -24,7 +24,7 @@ def save_images_for_fid(
     """Saves a batch of image tensors as PNG files for FID calculation."""
     os.makedirs(output_dir, exist_ok=True)
     # Denormalize from [-1, 1] to [0, 1], then to [0, 255] uint8
-    images_tensor = (images_tensor + 1) / 2.0
+    images_tensor = (images_tensor.float() + 1) / 2.0
     images_tensor = images_tensor.mul(255).add_(0.5).clamp_(0, 255)
     images_tensor = images_tensor.permute(0, 2, 3, 1).to('cpu', torch.uint8)
     images_np = images_tensor.numpy()
@@ -118,7 +118,7 @@ def calculate_fid_stats_for_path(
     sigma -= torch.outer(mu, mu) * total_processed
     sigma /= (total_processed - 1) if total_processed > 1 else 1
     
-    return mu.cpu().numpy(), sigma.cpu().numpy()
+    return mu.float().cpu().numpy(), sigma.float().cpu().numpy()
 
 def calculate_fid_score(
     mu_gen: np.ndarray,

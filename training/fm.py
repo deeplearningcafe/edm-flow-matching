@@ -498,7 +498,7 @@ def train_flow_matching_edm_with_songunet(
         print(f"Starting Flow Matching training for SongUNet (EDM pre-trained)...")
         for epoch in range(epochs):
             model.train()
-            epoch_loss_accum = 0.0
+            epoch_loss_accum = torch.tensor([0.0], device=device, dtype=dtype)
             num_batches_epoch = 0
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
 
@@ -548,7 +548,7 @@ def train_flow_matching_edm_with_songunet(
                 if scheduler:
                     scheduler.step()
 
-                epoch_loss_accum += loss.item()
+                epoch_loss_accum += loss.detach()
                 num_batches_epoch += 1
 
                 if logging_utils.is_wandb_initialized():
@@ -568,10 +568,10 @@ def train_flow_matching_edm_with_songunet(
                    (batch_idx + 1) == len(train_loader):
                     # Increment custom step counter for evaluation logs
                     eval_step_counter += 1
-                    avg_train_loss_interval = epoch_loss_accum / num_batches_epoch
+                    avg_train_loss_interval = (epoch_loss_accum / num_batches_epoch).item()
                     
                     model.eval()
-                    val_loss = 0.0
+                    val_loss = torch.tensor([0.0], device=device, dtype=dtype)
                     with torch.no_grad():
                         for batch in tqdm(test_loader, desc="Evaluating", leave=False):
                             x1_batch = batch[0].to(dtype=dtype).to(device)
@@ -585,9 +585,9 @@ def train_flow_matching_edm_with_songunet(
                                 dtype=dtype,
                                 use_custom_unet=use_custom_unet
                             )
-                            val_loss += loss.item()
+                            val_loss += loss.detach()
 
-                    val_loss = val_loss / len(test_loader)
+                    val_loss = (val_loss / len(test_loader)).item()
 
                     print(f"\nEpoch {epoch+1}, Batch {batch_idx+1}/"
                           f"{len(train_loader)}, EvalStep {eval_step_counter}: "
@@ -644,7 +644,7 @@ def train_flow_matching_edm_with_songunet(
                 gen_labels = None
                 if model_label_dim > 0:
                     # Ensure labels are within the valid range [0, model_label_dim - 1]
-                    num_labels_to_gen = min(model_label_dim, num_gen_samples_epoch_end)
+                    # num_labels_to_gen = min(model_label_dim, num_gen_samples_epoch_end)
                     if num_gen_samples_epoch_end <= model_label_dim:
                         # If batch size <= number of classes, use sequential labels
                         gen_labels = torch.arange(num_gen_samples_epoch_end, device=device)
@@ -794,6 +794,7 @@ def train_flow_matching_edm_with_songunet(
                 logging_utils._wandb_run.dir if hasattr(logging_utils._wandb_run, 'dir') else ".",
                 "edm_fm_final_model.pt"
             )
+            # saved as an ordered dict
             torch.save(model.state_dict(), final_save_path)
             wandb.save(final_save_path, base_path=os.path.dirname(final_save_path))
             print(f"Final model saved to {final_save_path} and W&B.")

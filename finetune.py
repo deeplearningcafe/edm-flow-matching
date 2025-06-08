@@ -202,15 +202,15 @@ def train(
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
     # Compile model if PyTorch 2.0+
-    if hasattr(torch, 'compile') and callable(torch.compile):
-        print("Compiling model with torch.compile()...")
-        try:
-            unet_model = torch.compile(unet_model, mode="default") # Or "reduce-overhead"
-            print("Model compiled successfully.")
-        except Exception as e:
-            print(f"torch.compile failed: {e}. Proceeding without compilation.")
-    else:
-        print("torch.compile not available. Proceeding without compilation.")
+    # if hasattr(torch, 'compile') and callable(torch.compile):
+    #     print("Compiling model with torch.compile()...")
+    #     try:
+    #         unet_model = torch.compile(unet_model, mode="default") # Or "reduce-overhead"
+    #         print("Model compiled successfully.")
+    #     except Exception as e:
+    #         print(f"torch.compile failed: {e}. Proceeding without compilation.")
+    # else:
+    #     print("torch.compile not available. Proceeding without compilation.")
 
     print(f"Loaded model and dataset for finetuning on '{dataset_name}'.")
 
@@ -287,22 +287,23 @@ if __name__ == '__main__':
     train(
         network_pkl=cifar10_edm_pkl,
         dataset_name="cifar10",
-        batch_size=16, # Adjust based on VRAM
-        learning_rate=5e-5,
-        epochs=5, # For a quick test
+        batch_size=128, # Adjust based on VRAM 160?
+        learning_rate=8e-5,
+        epochs=50, # For a quick test
         eval_interval=100000, # Evaluate more frequently for small datasets
-        patience=5,
-        num_gen_samples_epoch_end = 16,
+        patience=10,
+        num_workers=4,
+        num_gen_samples_epoch_end = 64,
         num_inference_steps_epoch_end = 50,
-        # dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
-        dtype=torch.float32,
+        dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
+        # dtype=torch.float32,
         wandb_project_name="my-edm-fm-tests", # Change to your project
         wandb_run_name_prefix="cifar10-fm-test",
         wandb_entity="YOUR-WANDB", # Set your entity
-        fid_eval_epochs=1, # Evaluate FID every epoch for this test
-        fid_num_samples=32, # Small number for quick test
-        fid_gen_batch_size=16,
-        fid_inception_batch_size=16,
+        fid_eval_epochs=2, # Evaluate FID every epoch for this test
+        fid_num_samples=1000, # Small number for quick test
+        fid_gen_batch_size=64,
+        fid_inception_batch_size=128,
         fid_ref_path=cifar10_fid_ref_path, # Path to CIFAR10 FID stats
         fid_num_workers=2, # Simpler for small test
         use_custom_unet=False,
@@ -327,4 +328,5 @@ if __name__ == '__main__':
 
 """
 Update the generate samples such that it generates a unique image with several generations like the example.py
+Using bfloat16, tensor cores and w/o compile, with bs of 128, 1.33it/s, 1 epoch 5 min.
 """
