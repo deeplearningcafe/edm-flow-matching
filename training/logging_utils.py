@@ -1,8 +1,10 @@
 ### logging_utils.py ###
 import wandb
+from huggingface_hub import HfApi
 
 # Store the run object globally within this module once initialized
 _wandb_run = None
+_hf_api = None
 
 def init_wandb(project_name: str, run_name: str = None, config: dict = None, entity: str = None):
     """
@@ -99,3 +101,49 @@ def finish_wandb():
 def is_wandb_initialized():
     """Checks if W&B has been successfully initialized."""
     return _wandb_run is not None
+
+def init_hfapi(token: str=None):
+    """
+    Initializes a HfApi.
+
+    Args:
+        token (str): If none is passed uses the system token after logging
+    """
+    global _hf_api
+    try:
+        _hf_api = HfApi(
+            token=token,
+        )
+        print(f"HfApi run initialized")
+    except Exception as e:
+        print(f"Error initializing HfApi: {e}. HfApi logging will be disabled.")
+        _hf_api = None # Ensure it's None if init fails
+
+def log_folder(
+    folder_path: str,
+    repo_id: str="",  # Can be PIL Image, numpy array, torch tensor, or path to image
+):
+    """
+    Logs an image to W&B with explicit step and commit control.
+
+    Args:
+        folder_path (str): Key for the image in W&B dashboard.
+        repo_id (str, optional): Caption for the image.
+    """
+    if _hf_api:
+        try:
+            if len(repo_id) < 1:
+                repo_id = "edm-flow-matching"
+            _hf_api.create_repo(repo_id, private=True,
+                                repo_type="model", exist_ok=True)
+            _hf_api.upload_large_folder(
+                repo_id=repo_id,
+                repo_type="model",
+                folder_path=folder_path
+            )
+        except Exception as e:
+            print(f"Error logging folder to HfApi: {e}")
+
+def is_hfapi_initialized():
+    """Checks if HfApi has been successfully initialized."""
+    return _hf_api is not None

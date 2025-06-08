@@ -357,7 +357,8 @@ def train_flow_matching_edm_with_songunet(
     fid_inception_batch_size: int = 64, 
     fid_ref_path: str = None, 
     fid_num_workers: int = 2,
-    use_custom_unet=False,
+    use_custom_unet: bool = False,
+    hf_repo:str = "",
 ):
     if edm_params is None:
         edm_params = {
@@ -387,6 +388,7 @@ def train_flow_matching_edm_with_songunet(
         config=log_config,
         entity=wandb_entity
     )
+    logging_utils.init_hfapi()
 
     # Define custom metrics after wandb initialization
     if logging_utils.is_wandb_initialized():
@@ -720,7 +722,7 @@ def train_flow_matching_edm_with_songunet(
                                 step=global_step,
                             )
 
-        
+
             perform_fid = (
                 fid_ref_path and 
                 inception_model is not None and # Check if model was passed
@@ -788,17 +790,18 @@ def train_flow_matching_edm_with_songunet(
             # You might want to log the error message to W&B as well
             # _wandb_run.summary["error_message"] = str(e)
     finally:
+        # Save final model if not early stopped or if desired
+        final_save_path = os.path.join(
+            logging_utils._wandb_run.dir if hasattr(logging_utils._wandb_run, 'dir') else ".",
+            "edm_fm_final_model.pt"
+        )
+        # saved as an ordered dict
+        torch.save(model.state_dict(), final_save_path)
+        if logging_utils.is_hfapi_initialized():
+            logging_utils.log_folder(logging_utils._wandb_run.dir, hf_repo)
         if logging_utils.is_wandb_initialized():
-            # Save final model if not early stopped or if desired
-            final_save_path = os.path.join(
-                logging_utils._wandb_run.dir if hasattr(logging_utils._wandb_run, 'dir') else ".",
-                "edm_fm_final_model.pt"
-            )
-            # saved as an ordered dict
-            torch.save(model.state_dict(), final_save_path)
             wandb.save(final_save_path, base_path=os.path.dirname(final_save_path))
             print(f"Final model saved to {final_save_path} and W&B.")
             logging_utils.finish_wandb()
-
     # Return model and any tracked local metrics if needed outside W&B
     return model # Placeholder for local metrics if you re-enable them

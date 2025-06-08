@@ -133,7 +133,8 @@ def train(
         fid_inception_batch_size: int = 64,
         fid_ref_path: str = None, # e.g., "fid-refs/cifar10-32x32.npz"
         fid_num_workers: int = 2,
-        use_custom_unet=False
+        use_custom_unet=False,
+        hf_repo:str = "",
 ):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -271,7 +272,8 @@ def train(
         fid_inception_batch_size=fid_inception_batch_size,
         fid_ref_path=fid_ref_path,
         fid_num_workers=fid_num_workers,
-        use_custom_unet=use_custom_unet
+        use_custom_unet=use_custom_unet,
+        hf_repo=hf_repo,
     )
     print("Finetuning process finished.")
 
@@ -307,6 +309,7 @@ if __name__ == '__main__':
         fid_ref_path=cifar10_fid_ref_path, # Path to CIFAR10 FID stats
         fid_num_workers=2, # Simpler for small test
         use_custom_unet=False,
+        hf_repo= "edm-fm",
     )
 
     # To run STL10 finetuning (your main goal for distribution shift)
@@ -329,4 +332,6 @@ if __name__ == '__main__':
 """
 Update the generate samples such that it generates a unique image with several generations like the example.py
 Using bfloat16, tensor cores and w/o compile, with bs of 128, 1.33it/s, 1 epoch 5 min.
+huggingface-cli login
+wandb login
 """

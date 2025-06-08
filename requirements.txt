@@ -2,3 +2,4 @@ tqdm
 wandb
 matplotlib
 scipy
+huggingface_hub
