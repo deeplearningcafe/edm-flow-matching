@@ -20,7 +20,8 @@ def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
     import PIL.Image
     
     batch_size = images.shape[0]
-    # images are already float from the generation function
+    # cpu, torch.Size([16, 3, 32, 32]), torch.float32, -2.4811506271362305, 2.4094202518463135
+    # print(f"Images in grid: {images.device}, {images.shape}, {images.dtype}, {images.min()}, {images.max()}")
     images = images.float()
     if batch_size < gridw * gridh:
         # Pad with zeros if we don't have enough images
@@ -45,7 +46,7 @@ def create_image_grid(images: torch.Tensor, gridw: int = 8, gridh: int = 8):
     images = images.reshape(gridh * H, gridw * W, C)
     
     # Convert to PIL Image
-    images = images.float().cpu().numpy()
+    images = images.cpu().numpy()
     if C == 1:  # Grayscale
         images = images.squeeze(-1)
         return PIL.Image.fromarray(images, 'L')
@@ -182,33 +183,8 @@ def plot_generation_steps_with_grid(
         grid_filename = filename.replace('.png', '_grid.png')
         grid_image.save(grid_filename)
         print(f"Saved image grid to {grid_filename}")
-        
-        # Also create a matplotlib subplot for the grid in the main figure
-        ax_grid = fig.add_subplot(gs[1])
-        ax_grid.imshow(np.array(grid_image), cmap='gray' if final_images.shape[1] == 1 else None)
-        ax_grid.set_title(f"Generated Batch Grid - Epoch {epoch}", fontsize=12)
-        ax_grid.set_xticks([])
-        ax_grid.set_yticks([])
-        
-        # Add custom x-axis information
-        info_text = f"Epoch: {epoch} | Eval Interval: {eval_interval} | Batch Size: {final_images.shape[0]}"
-        ax_grid.text(0.5, -0.1, info_text, transform=ax_grid.transAxes, 
-                    ha='center', va='top', fontsize=10)
-    
-    # Save combined figure
-    fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    
-    try:
-        fig.savefig(filename, dpi=100, bbox_inches='tight')
-        print(f"Saved combined plot to {filename}")
-        plt.close(fig)
         return filename
-    except Exception as e:
-        print(f"Error saving plot: {e}")
-        plt.close(fig)
-        return None
-
+    
 def generate_samples_edm_fm(
     unet_model: torch.nn.Module, # Expects a SongUNet instance
     num_samples: int = 10,

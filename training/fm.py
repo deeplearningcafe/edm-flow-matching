@@ -628,7 +628,7 @@ def train_flow_matching_edm_with_songunet(
                 global_step += 1
 
             # --- End of Epoch ---
-            avg_epoch_loss = epoch_loss_accum / num_batches_epoch if num_batches_epoch > 0 else float('inf')
+            avg_epoch_loss = (epoch_loss_accum / num_batches_epoch).item() if num_batches_epoch > 0 else float('inf')
             print(f"End of Epoch {epoch+1}/{epochs}: Avg Train Loss: {avg_epoch_loss:.4f}")
             if logging_utils.is_wandb_initialized():
                 logging_utils.log_metrics({
