@@ -58,11 +58,10 @@ def plot_generation_steps_with_grid(
     batch_labels: torch.Tensor = None,
     num_classes: int = 10,
     filename: str = "generation_results.png",
-    title: str = "Generation Results",
     epoch: int = 0,
-    eval_interval: int = 100,
     gridw: int = 8,
-    gridh: int = 8
+    gridh: int = 8,
+    num_inference_steps: int = 50,
 ):
     """
     Enhanced plotting function that creates both trajectory and grid plots.
@@ -72,11 +71,10 @@ def plot_generation_steps_with_grid(
         batch_labels: Labels for the batch, used to select one sample per class
         num_classes: Number of classes (for trajectory selection)
         filename: Output filename
-        title: Plot title
         epoch: Current epoch number
-        eval_interval: Evaluation interval for custom x-axis
         gridw: Grid width for final image grid
         gridh: Grid height for final image grid
+        num_inference_steps: Total steps used in generation for title accuracy.
     """
     if not trajectory or len(trajectory) == 0:
         print("Trajectory list is empty.")
@@ -155,7 +153,7 @@ def plot_generation_steps_with_grid(
                     else:
                         # Calculate approximate step based on position
                         progress = j / (num_steps - 1)
-                        step_num = int(progress * 50)  # Assuming 50 inference steps
+                        step_num = int(progress * num_inference_steps)  # Assuming 50 inference steps
                         step_label = f"Step ~{step_num}"
                     ax.set_title(step_label, fontsize=9)
                 
@@ -198,6 +196,7 @@ def generate_samples_edm_fm(
     # unet_label_dim is SongUNet's label_dim
     unet_label_dim: int = 0,
     dtype=torch.float32,
+    num_trajectory_saves: int = 10,
 ):
     """
     Generates samples using Flow Matching with a SongUNet.
@@ -263,6 +262,16 @@ def generate_samples_edm_fm(
                     f"and cannot be broadcasted."
                 )
 
+    if num_trajectory_saves > 1 and num_inference_steps > 1:
+        # Calculate interval to get roughly num_trajectory_saves images.
+        # We use num_trajectory_saves - 1 because we want N-1 intervals
+        # to produce N points.
+        save_interval = max(1, num_inference_steps // (num_trajectory_saves - 1))
+    else:
+        # If saving 1 or 0 images, never save in the loop; the final
+        # image will be appended after the loop regardless.
+        save_interval = num_inference_steps + 1
+
     with torch.no_grad():
         # for i in tqdm(range(num_inference_steps), desc="Sampling (EDM-FM)"):
         for i in range(num_inference_steps):
@@ -288,8 +297,7 @@ def generate_samples_edm_fm(
 
             x = x + v * dt # Euler step
 
-            if (i + 1) % max(num_inference_steps // 10, 1) == 0 or \
-               i == num_inference_steps - 1:
+            if (i + 1) % save_interval == 0 or i == num_inference_steps - 1:
                 trajectory.append(x.detach().float().cpu())
 
     unet_model.train() # Set back to train mode

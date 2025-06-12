@@ -442,17 +442,17 @@ def create_aligned_stl10_test_dataloader(batch_size=64, num_workers=2):
     )
 
     aligned_test_dataset = STL10CIFAR10AlignedDataset(stl10_test_dataset)
-    num_test = len(aligned_test_dataset)
-    half = num_test // 4
-    indices = list(range(num_test))
+    # num_test = len(aligned_test_dataset)
+    # half = num_test // 4
+    # indices = list(range(num_test))
     # Optionally shuffle for a random split:
     # import random; random.shuffle(indices)
 
-    first_half_idxs = indices[:half]
-    second_half_idxs = indices[half:]
+    # first_half_idxs = indices[:half]
+    # second_half_idxs = indices[half:]
 
-    # Create two subsets
-    aligned_test_dataset = Subset(aligned_test_dataset, first_half_idxs)
+    # # Create two subsets
+    # aligned_test_dataset = Subset(aligned_test_dataset, first_half_idxs)
 
     test_dataloader = DataLoader(
         dataset=aligned_test_dataset,

@@ -135,6 +135,8 @@ def train(
         fid_num_workers: int = 2,
         use_custom_unet=False,
         hf_repo:str = "",
+        num_trajectory_saves: int = 10,
+        eval_every_n_epochs: int = 1,
 ):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -274,6 +276,8 @@ def train(
         fid_num_workers=fid_num_workers,
         use_custom_unet=use_custom_unet,
         hf_repo=hf_repo,
+        num_trajectory_saves=num_trajectory_saves,
+        eval_every_n_epochs=eval_every_n_epochs,
     )
     print("Finetuning process finished.")
 
@@ -310,6 +314,8 @@ if __name__ == '__main__':
         fid_num_workers=2, # Simpler for small test
         use_custom_unet=False,
         hf_repo= "edm-fm",
+        num_trajectory_saves=10,
+        eval_every_n_epochs=1,
     )
 
     # To run STL10 finetuning (your main goal for distribution shift)

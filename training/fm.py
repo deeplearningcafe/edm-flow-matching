@@ -187,6 +187,7 @@ def flow_matching_step_min_rf(
             unet_noise_labels,
             encoder_hidden_states=cond_input.long().unsqueeze(-1).unsqueeze(-1),
         )
+    # in the kohya scripts they use float() when computing loss despite the model type
     batchwise_mse = ((x1 - x0 - v_pred) ** 2).mean(dim=list(range(1, len(x1.shape))))
     return batchwise_mse.mean()
 
@@ -359,6 +360,8 @@ def train_flow_matching_edm_with_songunet(
     fid_num_workers: int = 2,
     use_custom_unet: bool = False,
     hf_repo:str = "",
+    num_trajectory_saves: int = 10,
+    eval_every_n_epochs: int = 1,
 ):
     if edm_params is None:
         edm_params = {
@@ -471,7 +474,7 @@ def train_flow_matching_edm_with_songunet(
         if cosine_t_max <= 0: cosine_t_max = 1
 
         scheduler_2 = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cosine_t_max, eta_min=lr * 0.01 # Adjusted eta_min
+            optimizer, T_max=cosine_t_max, eta_min=lr
         )
         if warmup_steps > 0:
             scheduler = optim.lr_scheduler.SequentialLR(
@@ -503,23 +506,14 @@ def train_flow_matching_edm_with_songunet(
             epoch_loss_accum = torch.tensor([0.0], device=device, dtype=dtype)
             num_batches_epoch = 0
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            eval_save_epoch = False
 
             for batch_idx, batch in enumerate(progress_bar):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 x1_batch = batch[0].to(dtype=dtype).to(device)
                 cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
 
-                # loss = flow_matching_step(
-                #     unet_model=model,
-                #     x1=x1_batch,
-                #     cond_input=cond_input_batch,
-                #     generator=generator,
-                #     input_perturbation=True, # Often good for FM
-                #     edm_params=edm_params,
-                #     unet_label_dim=model_label_dim,
-                #     dtype=dtype
-                # )
                 loss = flow_matching_step_min_rf(
                     unet_model=model,
                     x1=x1_batch,
@@ -555,8 +549,8 @@ def train_flow_matching_edm_with_songunet(
 
                 if logging_utils.is_wandb_initialized():
                     log_payload = {
-                        "train/loss_step": loss.item(),
-                        "train/grad_norm_step": norm.item(),
+                        "train/loss_step": loss.detach().item(),
+                        "train/grad_norm_step": norm.detach().item(),
                         "learning_rate": optimizer.param_groups[0]['lr']
                     }
                     # Log LR for each group if multiple groups exist
@@ -568,65 +562,67 @@ def train_flow_matching_edm_with_songunet(
                 # Evaluation and logging
                 if (batch_idx + 1) % eval_interval == 0 or \
                    (batch_idx + 1) == len(train_loader):
-                    # Increment custom step counter for evaluation logs
-                    eval_step_counter += 1
-                    avg_train_loss_interval = (epoch_loss_accum / num_batches_epoch).item()
-                    
-                    model.eval()
-                    val_loss = torch.tensor([0.0], device=device, dtype=dtype)
-                    with torch.no_grad():
-                        for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-                            x1_batch = batch[0].to(dtype=dtype).to(device)
-                            cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
-                            loss = flow_matching_step_min_rf(
-                                unet_model=model,
-                                x1=x1_batch,
-                                cond_input=cond_input_batch,
-                                edm_params=edm_params,
-                                unet_label_dim=model_label_dim,
-                                dtype=dtype,
-                                use_custom_unet=use_custom_unet
-                            )
-                            val_loss += loss.detach()
+                    eval_save_epoch = epoch % eval_every_n_epochs == 0
+                    if eval_save_epoch:
+                        # Increment custom step counter for evaluation logs
+                        eval_step_counter += 1
+                        avg_train_loss_interval = (epoch_loss_accum / num_batches_epoch).item()
+                        
+                        model.eval()
+                        val_loss = torch.tensor([0.0], device=device, dtype=dtype)
+                        with torch.no_grad():
+                            for batch in tqdm(test_loader, desc="Evaluating", leave=False):
+                                x1_batch = batch[0].to(dtype=dtype).to(device)
+                                cond_input_batch = batch[1].to(dtype=dtype).to(device) if len(batch) > 1 else None
+                                loss = flow_matching_step_min_rf(
+                                    unet_model=model,
+                                    x1=x1_batch,
+                                    cond_input=cond_input_batch,
+                                    edm_params=edm_params,
+                                    unet_label_dim=model_label_dim,
+                                    dtype=dtype,
+                                    use_custom_unet=use_custom_unet
+                                )
+                                val_loss += loss.detach()
 
-                    val_loss = (val_loss / len(test_loader)).item()
+                        val_loss = (val_loss / len(test_loader)).item()
 
-                    print(f"\nEpoch {epoch+1}, Batch {batch_idx+1}/"
-                          f"{len(train_loader)}, EvalStep {eval_step_counter}: "
-                          f"Train Loss Interval: {avg_train_loss_interval:.4f}, "
-                          f"Val Loss: {val_loss:.4f}")
+                        print(f"\nEpoch {epoch+1}, Batch {batch_idx+1}/"
+                            f"{len(train_loader)}, EvalStep {eval_step_counter}: "
+                            f"Train Loss Interval: {avg_train_loss_interval:.4f}, "
+                            f"Val Loss: {val_loss:.4f}")
 
-                    if logging_utils.is_wandb_initialized():
-                        current_epoch_progress = epoch + \
-                            (batch_idx + 1) / len(train_loader)
-                        # Log eval metrics against custom 'eval_step'
-                        logging_utils.log_metrics({
-                            "eval/avg_val_loss": val_loss,
-                            "train/avg_loss_interval": avg_train_loss_interval,
-                            "eval/epoch_progress_at_eval": current_epoch_progress,
-                            "eval_step": eval_step_counter
-                        }, step=global_step, commit=False)
-
-                    # Checkpointing and Early Stopping
-                    if val_loss < best_eval_loss:
-                        best_eval_loss = val_loss
-                        current_patience = 0
-                        save_path = os.path.join(
-                            logging_utils._wandb_run.dir if logging_utils.is_wandb_initialized() and hasattr(logging_utils._wandb_run, 'dir') else ".",
-                            "edm_fm_best_model.pt"
-                        )
-                        torch.save(model.state_dict(), save_path)
-                        print(f"  -> New best val loss: {best_eval_loss:.4f}. Model saved to {save_path}")
                         if logging_utils.is_wandb_initialized():
-                            wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
-                    else:
-                        current_patience += 1
-                        if current_patience >= patience:
-                            print(f"Early stopping triggered after {patience} evaluations without improvement.")
+                            current_epoch_progress = epoch + \
+                                (batch_idx + 1) / len(train_loader)
+                            # Log eval metrics against custom 'eval_step'
+                            logging_utils.log_metrics({
+                                "eval/avg_val_loss": val_loss,
+                                "train/avg_loss_interval": avg_train_loss_interval,
+                                "eval/epoch_progress_at_eval": current_epoch_progress,
+                                "eval_step": eval_step_counter
+                            }, step=global_step, commit=False)
+
+                        # Checkpointing and Early Stopping
+                        if val_loss < best_eval_loss:
+                            best_eval_loss = val_loss
+                            current_patience = 0
+                            save_path = os.path.join(
+                                logging_utils._wandb_run.dir if logging_utils.is_wandb_initialized() and hasattr(logging_utils._wandb_run, 'dir') else ".",
+                                "edm_fm_best_model.pt"
+                            )
+                            torch.save(model.state_dict(), save_path)
+                            print(f"  -> New best val loss: {best_eval_loss:.4f}. Model saved to {save_path}")
                             if logging_utils.is_wandb_initialized():
-                                logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step)
-                            raise StopIteration # Use custom exception or break
-                    model.train()
+                                wandb.save(save_path, base_path=os.path.dirname(save_path)) # Save to W&B artifacts
+                        else:
+                            current_patience += 1
+                            if current_patience >= patience:
+                                print(f"Early stopping triggered after {patience} evaluations without improvement.")
+                                if logging_utils.is_wandb_initialized():
+                                    logging_utils.log_metrics({"training_control/early_stopped": True}, step=global_step)
+                                raise StopIteration # Use custom exception or break
+                        model.train()
                 global_step += 1
 
             # --- End of Epoch ---
@@ -639,7 +635,7 @@ def train_flow_matching_edm_with_songunet(
                 }, step=global_step, commit=False)
 
             # Generate and log samples at the end of each epoch
-            if num_gen_samples_epoch_end > 0:
+            if num_gen_samples_epoch_end > 0 and eval_save_epoch:
                 print("Generating samples for W&B logging...")
                 model.eval()
                 # Generate for a few fixed labels if conditional, or unconditionally
@@ -663,7 +659,7 @@ def train_flow_matching_edm_with_songunet(
                     actual_num_samples_to_gen = len(gen_labels)
 
 
-                if actual_num_samples_to_gen > 0:
+                if actual_num_samples_to_gen > 0 and eval_save_epoch:
                     images, traj = generate_samples_edm_fm(
                         model, num_samples=actual_num_samples_to_gen,
                         cond_input=gen_labels, device=device,
@@ -671,7 +667,8 @@ def train_flow_matching_edm_with_songunet(
                         img_shape=img_shape, edm_params=edm_params,
                         seed=seed + epoch if seed is not None else None, # Vary seed per epoch
                         unet_label_dim=model_label_dim,
-                        dtype=dtype
+                        dtype=dtype,
+                        num_trajectory_saves=num_trajectory_saves,
                     )
                     
                     # Log the final generated image grid
@@ -695,11 +692,12 @@ def train_flow_matching_edm_with_songunet(
                         batch_labels=gen_labels,
                         num_classes=model_label_dim if model_label_dim > 0 else 10,
                         filename=full_plot_path,
-                        title=f"FM Generation Results - Epoch {epoch+1}",
                         epoch=epoch+1,
                         eval_interval=eval_step_counter, 
                         gridw=8, 
-                        gridh=8)
+                        gridh=8,
+                        num_inference_steps=num_inference_steps_epoch_end
+                        )
 
                     if saved_plot_path and logging_utils.is_wandb_initialized():
                         # Log trajectory and grid separately if they exist
@@ -763,15 +761,15 @@ def train_flow_matching_edm_with_songunet(
 
 
             model.train() # Back to training mode
-
-            # Save epoch checkpoint (optional, can be frequent)
-            epoch_save_path = os.path.join(
-                logging_utils._wandb_run.dir if logging_utils.is_wandb_initialized() and hasattr(logging_utils._wandb_run, 'dir') else ".",
-                f"edm_fm_epoch_{epoch+1}.pt"
-            )
-            torch.save(model.state_dict(), epoch_save_path)
-            if logging_utils.is_wandb_initialized():
-                 wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
+            if eval_save_epoch:
+                # Save epoch checkpoint (optional, can be frequent)
+                epoch_save_path = os.path.join(
+                    logging_utils._wandb_run.dir if logging_utils.is_wandb_initialized() and hasattr(logging_utils._wandb_run, 'dir') else ".",
+                    f"edm_fm_epoch_{epoch+1}.pt"
+                )
+                torch.save(model.state_dict(), epoch_save_path)
+                if logging_utils.is_wandb_initialized():
+                    wandb.save(epoch_save_path, base_path=os.path.dirname(epoch_save_path), policy="end") # Save at end of run or if "live"
 
         print("Training finished normally.")
         logging_utils.log_metrics({}, step=global_step, commit=True)
