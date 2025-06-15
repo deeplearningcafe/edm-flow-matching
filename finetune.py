@@ -173,6 +173,7 @@ def train(
         unet_model = unet_model_custom()
     
     inception_model_instance = None
+    cifar10_ref = None
     if fid_eval_epochs > 0 and fid_ref_path:
         print("FID calculation is enabled. Attempting to load Inception model.")
         inception_model_instance, cifar10_ref = load_inception_model(device)

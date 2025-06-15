@@ -693,7 +693,6 @@ def train_flow_matching_edm_with_songunet(
                         num_classes=model_label_dim if model_label_dim > 0 else 10,
                         filename=full_plot_path,
                         epoch=epoch+1,
-                        eval_interval=eval_step_counter, 
                         gridw=8, 
                         gridh=8,
                         num_inference_steps=num_inference_steps_epoch_end
@@ -724,6 +723,7 @@ def train_flow_matching_edm_with_songunet(
             perform_fid = (
                 fid_ref_path and 
                 inception_model is not None and # Check if model was passed
+                fid_eval_epochs != 0 and
                 (epoch + 1) % fid_eval_epochs == 0 and 
                 fid_num_samples > 0 and
                 fid_eval_epochs > 0 # Ensure fid_eval_epochs is positive
@@ -750,7 +750,7 @@ def train_flow_matching_edm_with_songunet(
                     edm_params=edm_params,
                     dtype=dtype
                 )
-            elif (epoch + 1) % fid_eval_epochs == 0 and fid_eval_epochs > 0:
+            elif fid_eval_epochs != 0 and (epoch + 1) % fid_eval_epochs == 0 and fid_eval_epochs > 0:
                 # Log why FID was skipped if it was supposed to run
                 reason = []
                 if not fid_ref_path: reason.append("fid_ref_path not set")
